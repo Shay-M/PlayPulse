@@ -1,0 +1,27 @@
+{
+  "name": "Settings screen",
+  "description": "Opens a common settings coordinate and captures the result.",
+  "enabled": false,
+  "steps": [
+    {
+      "type": "launch_app"
+    },
+    {
+      "type": "wait",
+      "seconds": 1
+    },
+    {
+      "type": "tap_coordinates",
+      "x": 960,
+      "y": 180
+    },
+    {
+      "type": "wait",
+      "seconds": 1
+    },
+    {
+      "type": "take_screenshot",
+      "name": "settings"
+    }
+  ]
+}
