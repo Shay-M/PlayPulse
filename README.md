@@ -15,7 +15,8 @@ The current version is frontend-first, with a hardened manual ADB screenshot wor
 - Real ADB device discovery and `screencap` PNG capture when Android platform-tools are installed
 - Automatic fallback screenshot capture using `shell screencap`, `pull`, and cleanup when `exec-out` fails
 - Internal ADB Flow Engine for repeatable JSON-based screenshot flows without Maestro
-- Locale Preparation Strategy for app-language, device-language, widget, and combined localized screenshot workflows
+- Simplified Locale Preparation workflow with readiness validation before multi-locale capture
+- Persistent ADB settings using `QSettings`, including saved `adb.exe` path, selected device, output folder, and last project path
 - Flow Editor with add, duplicate, delete, save, load, step editing, single-step run, full-flow run, and all-enabled-flow run
 - Mock screenshot capture fallback for UI demos without a connected device
 - Flexible screenshot flow planning with presets, manual flows, mock project screen discovery, and optional Maestro YAML flow loading
@@ -65,6 +66,37 @@ To capture real screenshots:
 
 PlayPulse validates the screenshot file after capture. It checks the adb exit code, file existence, file size, and PNG signature bytes.
 
+## ADB Path and Android Version Detection
+
+`adb` does not have to be available globally in PowerShell. PlayPulse can use the full Android SDK platform-tools path and save it between runs.
+
+Example Windows path:
+
+```text
+C:\Users\shay\AppData\Local\Android\Sdk\platform-tools\adb.exe
+```
+
+On the Screenshots page:
+
+1. Click `Select adb.exe manually` and choose the full `adb.exe` path.
+2. Click `Save adb path`.
+3. Click `Test adb path` or `Run ADB Diagnostics`.
+4. Select the real device serial, for example `emulator-5554`.
+5. Click `Detect Android version`.
+
+All ADB operations go through `ADBService.run_adb_command(...)`, so device refresh, diagnostics, Android version detection, manual screenshots, fallback screenshots, internal flows, locale preparation, and widget capture all use the same resolved `adb.exe` path.
+
+Android version detection runs the resolved command with the selected serial:
+
+```text
+<resolved_adb_path> -s <device_serial> shell getprop ro.build.version.sdk
+<resolved_adb_path> -s <device_serial> shell getprop ro.build.version.release
+<resolved_adb_path> -s <device_serial> shell getprop ro.product.manufacturer
+<resolved_adb_path> -s <device_serial> shell getprop ro.product.model
+```
+
+If it fails, copy ADB diagnostics. They include the resolved path, selected serial, last command, exit code, stdout, and stderr.
+
 ## Internal ADB Flow Engine
 
 The Screenshots page includes PlayPulse's own internal automation backend for repeatable screenshot flows. It does not require Maestro.
@@ -113,20 +145,46 @@ Each run reports progress per step, for example `Running step 1/3: launch_app`. 
 
 ## Localized Screenshots and Locale Preparation
 
-Saving screenshots under locale folders does not automatically change the app or Android device language. PlayPulse now supports multiple Locale Preparation Strategies so screenshots can be captured in the intended language before files are written to each locale folder.
+Saving screenshots under locale folders does not automatically change the app or Android device language. Locale folders only control where screenshots are saved.
 
-Supported preparation modes:
+To capture real localized screenshots, configure and test Locale Preparation before running a multi-locale capture.
 
-- `None`: use the current device and app language. If multiple locales are selected, all screenshots may be captured in the same current language.
-- `App debug command`: run an app-owned deep link or broadcast, such as `myapp://playpulse/set-locale?locale={locale}` or `am broadcast -a ... --es locale {locale}`.
-- `In-app recorded language flow`: use an Internal ADB Flow to navigate the app settings and select the locale.
-- `Device language command / assisted mode`: detect device information, open Android language settings, and optionally run a recorded device-language flow.
-- `Device language recorded flow`: run a reusable Internal ADB Flow against Android Settings to change system language.
-- `Combined mode`: prepare device language first, then app language, then capture.
+The Screenshots page now shows a readiness summary and a per-locale table before capture:
 
-For in-app screenshots, the most reliable options are usually `App debug command` or `In-app recorded language flow`. For widget and home-screen screenshots, Android system language often matters because widgets can be rendered by the launcher, so `Device language recorded flow` or `Combined mode` is recommended.
+- Capture target
+- Language preparation configured or not configured
+- Selected locale count
+- Ready to capture yes/no
+- Resolved adb path status
+- Selected device serial
+- Per-locale assigned command or flow
+- Last preparation test result
 
-Device language switching is Android-version, device, emulator, and launcher dependent. Recorded device language flows may need to be created per emulator type or Android version. For apps we control, the most reliable app-level approach is a debug-only deep link or broadcast that changes the app locale internally. Manual ADB screenshot capture remains available for quick testing and diagnosis.
+For in-app screenshots, PlayPulse shows only:
+
+- `Current language only`
+- `App debug command`
+- `In-app recorded language flow`
+- `Combined: device + app language`
+
+For widget and home-screen screenshots, PlayPulse shows only:
+
+- `Current language only`
+- `Device language recorded flow`
+- `Combined: device + app language`
+
+Multi-locale capture is blocked when Locale Preparation is not real enough to change language:
+
+- One locale with `Current language only` is allowed.
+- Multiple locales with `Current language only` are blocked.
+- `App debug command` requires a valid deep link template or broadcast configuration.
+- `In-app recorded language flow` requires every locale to have an assigned app-language flow.
+- `Device language recorded flow` requires every locale to have an assigned device-language flow.
+- Opening Android language settings alone is not considered a successful language change.
+
+For apps you control, the most reliable app-level approach is usually a debug-only deep link or broadcast that changes the app locale internally. For widgets, Android system language often matters because widgets can be rendered by the launcher, so device language preparation or combined mode is usually required.
+
+Device language switching is Android-version, device, emulator, and launcher dependent. Recorded device language flows may need to be created per emulator type or Android version. Manual ADB screenshot capture remains available for quick testing and diagnosis.
 
 Locale preparation settings are saved to:
 
@@ -162,6 +220,19 @@ Example:
 }
 ```
 
+## Why Are All Screenshots in the Same Language?
+
+If every locale folder contains screenshots in the same language, the files were saved into separate folders but the app or device language was not changed before capture.
+
+Use one of these preparation methods before running all captures:
+
+- `App debug command` for apps that expose a debug deep link or broadcast.
+- `In-app recorded language flow` when language is changed inside the app settings UI.
+- `Device language recorded flow` for Android system language changes.
+- `Combined: device + app language` when capturing both app screens and widgets.
+
+Always click `Test selected locale` or `Test all locales` before a full capture. For widget screenshots, device language preparation is usually required.
+
 ## Manual Screenshot Troubleshooting
 
 If manual screenshot capture does not work:
@@ -175,11 +246,12 @@ adb devices -l
 
 3. Check that the selected device status is `device`, not `offline` or `unauthorized`.
 4. If adb is not detected, click `Select adb.exe manually` and choose the Android SDK platform-tools `adb.exe`.
-5. Click `Test device connection`.
-6. Click `Test screencap command`.
-7. Confirm the screenshot output folder exists and is writable.
-8. Confirm the app is installed, open, and visible on the emulator/device.
-9. If `exec-out` fails, PlayPulse automatically tries the fallback capture method:
+5. Click `Save adb path` so PlayPulse remembers it between runs.
+6. Click `Test device connection`.
+7. Click `Test screencap command`.
+8. Confirm the screenshot output folder exists and is writable.
+9. Confirm the app is installed, open, and visible on the emulator/device.
+10. If `exec-out` fails, PlayPulse automatically tries the fallback capture method:
 
 ```bash
 adb -s <device_serial> shell screencap -p /sdcard/playpulse_screen.png
@@ -187,7 +259,7 @@ adb -s <device_serial> pull /sdcard/playpulse_screen.png <local_output_file>
 adb -s <device_serial> shell rm /sdcard/playpulse_screen.png
 ```
 
-10. Click `Copy diagnostics to clipboard` and share the diagnostics text if the issue persists.
+11. Click `Copy diagnostics to clipboard` and share the diagnostics text if the issue persists.
 
 The diagnostics panel reports the adb path, how adb was found, adb version, raw device output, selected serial, capture backend, output folder writability, last adb command, exit code, stdout, stderr, last screenshot path, whether the file exists, file size, and the capture method used.
 
@@ -253,6 +325,7 @@ app/
     adb_service.py
     internal_adb_flow_service.py
     locale_preparation_service.py
+    settings_service.py
     screenshot_service.py
     fastlane_service.py
   models/

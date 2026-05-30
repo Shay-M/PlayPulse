@@ -19,6 +19,7 @@ from app.services.internal_adb_flow_service import InternalADBFlowService
 from app.services.log_service import LogService
 from app.services.project_scanner import ProjectScanner
 from app.services.screenshot_service import ScreenshotService
+from app.services.settings_service import SettingsService
 from app.ui.pages.deployment_page import DeploymentPage
 from app.ui.pages.logs_page import LogsPage
 from app.ui.pages.metadata_page import MetadataPage
@@ -34,10 +35,12 @@ class MainWindow(QWidget):
         self.setWindowTitle("Android Store Localization & Deployment Tool")
         self.setMinimumSize(1240, 780)
         self.app_state = AppState()
+        self.settings_service = SettingsService()
+        self.settings_service.load_into_state(self.app_state)
         self.log_service = LogService()
         self.project_scanner = ProjectScanner()
         self.gemini_service = GeminiService()
-        self.adb_service = ADBService()
+        self.adb_service = ADBService(self.settings_service)
         self.internal_flow_service = InternalADBFlowService(self.adb_service)
         self.screenshot_service = ScreenshotService(self.adb_service, self.internal_flow_service)
         self.fastlane_service = FastlaneService()
@@ -61,6 +64,7 @@ class MainWindow(QWidget):
             self.app_state,
             self.log_service,
             self.project_scanner,
+            self.settings_service,
             self.worker_pool,
         )
         self.metadata_page = MetadataPage(
@@ -75,6 +79,7 @@ class MainWindow(QWidget):
             self.adb_service,
             self.screenshot_service,
             self.internal_flow_service,
+            self.settings_service,
             self.worker_pool,
         )
         self.deployment_page = DeploymentPage(

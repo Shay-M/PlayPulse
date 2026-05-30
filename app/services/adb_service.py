@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List
 
 from app.models.device_info import DeviceInfo
+from app.services.settings_service import SettingsService
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -124,7 +125,8 @@ class ADBUserError(RuntimeError):
 
 
 class ADBService:
-    def __init__(self) -> None:
+    def __init__(self, settings_service: SettingsService | None = None) -> None:
+        self.settings_service = settings_service
         self.manual_adb_path: str = ""
         self.last_command_result = ADBCommandResult()
         self.last_diagnostics = ADBDiagnostics()
@@ -133,26 +135,25 @@ class ADBService:
         self.manual_adb_path = path.strip()
 
     def resolve_adb_path(self, manual_adb_path: str = "") -> ADBPathInfo:
+        saved_path = self.settings_service.adb_path() if self.settings_service else ""
         manual_path = manual_adb_path.strip() or self.manual_adb_path
         searched_paths: List[str] = []
 
-        if manual_path:
-            candidate = Path(manual_path).expanduser()
+        for source, configured_path in [
+            ("saved adb path", saved_path),
+            ("manually selected path", manual_path),
+        ]:
+            if not configured_path:
+                continue
+            candidate = Path(configured_path).expanduser()
             searched_paths.append(str(candidate))
             if candidate.exists() and candidate.is_file():
-                return ADBPathInfo(True, str(candidate), "manually selected path", searched_paths)
-            return ADBPathInfo(
-                False,
-                "",
-                "manually selected path",
-                searched_paths,
-                "The selected adb.exe path does not exist.",
-            )
+                return self._adb_path_found(str(candidate), source, searched_paths)
 
         adb_from_path = shutil.which("adb")
         if adb_from_path:
             searched_paths.append(adb_from_path)
-            return ADBPathInfo(True, adb_from_path, "PATH", searched_paths)
+            return self._adb_path_found(adb_from_path, "PATH", searched_paths)
 
         for env_name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"]:
             env_value = os.environ.get(env_name, "")
@@ -162,20 +163,20 @@ class ADBService:
                 candidate = Path(env_value) / "platform-tools" / filename
                 searched_paths.append(str(candidate))
                 if candidate.exists() and candidate.is_file():
-                    return ADBPathInfo(True, str(candidate), f"{env_name}/platform-tools", searched_paths)
+                    return self._adb_path_found(str(candidate), f"{env_name}/platform-tools", searched_paths)
 
         local_app_data = os.environ.get("LOCALAPPDATA", "")
         if local_app_data:
             candidate = Path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe"
             searched_paths.append(str(candidate))
             if candidate.exists() and candidate.is_file():
-                return ADBPathInfo(True, str(candidate), "common Windows Android SDK path", searched_paths)
+                return self._adb_path_found(str(candidate), "common Windows Android SDK path", searched_paths)
 
         current_user = getpass.getuser()
         candidate = Path("C:/Users") / current_user / "AppData" / "Local" / "Android" / "Sdk" / "platform-tools" / "adb.exe"
         searched_paths.append(str(candidate))
         if candidate.exists() and candidate.is_file():
-            return ADBPathInfo(True, str(candidate), "common Windows Android SDK path", searched_paths)
+            return self._adb_path_found(str(candidate), "common Windows Android SDK path", searched_paths)
 
         return ADBPathInfo(
             False,
@@ -184,6 +185,11 @@ class ADBService:
             searched_paths,
             "ADB was not found. Install Android platform-tools or select adb.exe manually.",
         )
+
+    def _adb_path_found(self, path: str, source: str, searched_paths: List[str]) -> ADBPathInfo:
+        if self.settings_service:
+            self.settings_service.save_adb_path(path)
+        return ADBPathInfo(True, path, source, list(searched_paths))
 
     def refresh_devices(self, manual_adb_path: str = "") -> List[DeviceInfo]:
         diagnostics = self.run_diagnostics(manual_adb_path=manual_adb_path)
@@ -272,7 +278,7 @@ class ADBService:
     def test_device_connection(self, device: DeviceInfo, manual_adb_path: str = "") -> ADBDiagnostics:
         diagnostics = self.run_diagnostics(manual_adb_path=manual_adb_path, selected_device_serial=device.identifier)
         self._require_ready_device(device, diagnostics)
-        result = self.run_adb_command(["-s", device.identifier, "get-state"], manual_adb_path=manual_adb_path, timeout=10)
+        result = self.run_adb_command(["get-state"], device_serial=device.identifier, manual_adb_path=manual_adb_path, timeout=10)
         diagnostics.last_executed_adb_command = result.command
         diagnostics.last_command_exit_code = result.exit_code
         diagnostics.last_stdout = result.stdout
@@ -303,7 +309,8 @@ class ADBService:
             output_path.unlink()
 
         primary_result = self.run_adb_command(
-            ["-s", device.identifier, "exec-out", "screencap", "-p"],
+            ["exec-out", "screencap", "-p"],
+            device_serial=device.identifier,
             manual_adb_path=manual_adb_path,
             timeout=30,
             binary_stdout=True,
@@ -380,14 +387,13 @@ class ADBService:
     def open_locale_settings(self, device_serial: str, manual_adb_path: str = "") -> None:
         result = self.run_adb_command(
             [
-                "-s",
-                device_serial,
                 "shell",
                 "am",
                 "start",
                 "-a",
                 "android.settings.LOCALE_SETTINGS",
             ],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=15,
         )
@@ -397,7 +403,8 @@ class ADBService:
 
     def go_home(self, device_serial: str, manual_adb_path: str = "") -> None:
         result = self.run_adb_command(
-            ["-s", device_serial, "shell", "input", "keyevent", "KEYCODE_HOME"],
+            ["shell", "input", "keyevent", "KEYCODE_HOME"],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=10,
         )
@@ -410,8 +417,6 @@ class ADBService:
             raise ADBUserError("Deep link template is empty.")
         result = self.run_adb_command(
             [
-                "-s",
-                device_serial,
                 "shell",
                 "am",
                 "start",
@@ -420,6 +425,7 @@ class ADBService:
                 "-d",
                 deep_link.strip(),
             ],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=15,
         )
@@ -439,8 +445,6 @@ class ADBService:
             raise ADBUserError("Broadcast action and extra key are required.")
         result = self.run_adb_command(
             [
-                "-s",
-                device_serial,
                 "shell",
                 "am",
                 "broadcast",
@@ -450,6 +454,7 @@ class ADBService:
                 extra_key.strip(),
                 extra_value,
             ],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=15,
         )
@@ -461,7 +466,8 @@ class ADBService:
         if not package_name.strip():
             raise ADBUserError("Package name is required to force stop the app.")
         result = self.run_adb_command(
-            ["-s", device_serial, "shell", "am", "force-stop", package_name.strip()],
+            ["shell", "am", "force-stop", package_name.strip()],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=12,
         )
@@ -490,20 +496,19 @@ class ADBService:
         if not selector_value.strip():
             raise ADBUserError(f"{selector_type} selector is required for UI tap.")
         temp_file = Path(tempfile.gettempdir()) / f"playpulse_uiautomator_{device_serial}.xml"
-        dump_command = [
-            "-s",
-            device_serial,
-            "shell",
-            "uiautomator",
-            "dump",
-            "/sdcard/window_dump.xml",
-        ]
-        dump_result = self.run_adb_command(dump_command, manual_adb_path=manual_adb_path, timeout=20)
+        dump_command = ["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"]
+        dump_result = self.run_adb_command(
+            dump_command,
+            device_serial=device_serial,
+            manual_adb_path=manual_adb_path,
+            timeout=20,
+        )
         if dump_result.exit_code != 0:
             raise ADBUserError(dump_result.stderr or dump_result.error_message or "Failed to dump UI hierarchy.")
 
         pull_result = self.run_adb_command(
-            ["-s", device_serial, "pull", "/sdcard/window_dump.xml", str(temp_file)],
+            ["pull", "/sdcard/window_dump.xml", str(temp_file)],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=20,
         )
@@ -524,7 +529,8 @@ class ADBService:
         x = int((bounds[0] + bounds[2]) / 2)
         y = int((bounds[1] + bounds[3]) / 2)
         tap_result = self.run_adb_command(
-            ["-s", device_serial, "shell", "input", "tap", str(x), str(y)],
+            ["shell", "input", "tap", str(x), str(y)],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=12,
         )
@@ -638,9 +644,10 @@ class ADBService:
     def run_adb_command(
         self,
         args: List[str],
-        manual_adb_path: str = "",
-        timeout: int = 20,
+        device_serial: str | None = None,
+        timeout: int = 60,
         binary_stdout: bool = False,
+        manual_adb_path: str = "",
     ) -> ADBCommandResult:
         path_info = self.resolve_adb_path(manual_adb_path)
         if not path_info.found:
@@ -648,7 +655,10 @@ class ADBService:
             self.last_command_result = result
             return result
 
-        command = [path_info.path] + args
+        command_args = list(args)
+        if device_serial and not (len(command_args) >= 2 and command_args[0] == "-s"):
+            command_args = ["-s", device_serial] + command_args
+        command = [path_info.path] + command_args
         command_text = " ".join(command)
         try:
             completed = subprocess.run(
@@ -723,10 +733,12 @@ class ADBService:
 
     def _read_device_property(self, device_serial: str, property_name: str, manual_adb_path: str = "") -> str:
         result = self.run_adb_command(
-            ["-s", device_serial, "shell", "getprop", property_name],
+            ["shell", "getprop", property_name],
+            device_serial=device_serial,
             manual_adb_path=manual_adb_path,
             timeout=12,
         )
+        self._record_command_result(device_serial, result, f"Read Android device property {property_name}.")
         if result.exit_code != 0:
             return ""
         return result.stdout.strip()
@@ -750,7 +762,12 @@ class ADBService:
             device = DeviceInfo(device, "Android device", "device")
         diagnostics.selected_device_serial = device.identifier
         self._require_ready_device(device, diagnostics)
-        result = self.run_adb_command(["-s", device.identifier] + args, manual_adb_path=manual_adb_path, timeout=timeout)
+        result = self.run_adb_command(
+            args,
+            device_serial=device.identifier,
+            manual_adb_path=manual_adb_path,
+            timeout=timeout,
+        )
         diagnostics.last_executed_adb_command = result.command
         diagnostics.last_command_exit_code = result.exit_code
         diagnostics.last_stdout = result.stdout
@@ -810,7 +827,8 @@ class ADBService:
     ) -> ADBCommandResult:
         remote_path = "/sdcard/playpulse_screen.png"
         shell_result = self.run_adb_command(
-            ["-s", device.identifier, "shell", "screencap", "-p", remote_path],
+            ["shell", "screencap", "-p", remote_path],
+            device_serial=device.identifier,
             manual_adb_path=manual_adb_path,
             timeout=30,
         )
@@ -818,11 +836,16 @@ class ADBService:
             return shell_result
 
         pull_result = self.run_adb_command(
-            ["-s", device.identifier, "pull", remote_path, str(output_path)],
+            ["pull", remote_path, str(output_path)],
+            device_serial=device.identifier,
             manual_adb_path=manual_adb_path,
             timeout=30,
         )
-        self.run_adb_command(["-s", device.identifier, "shell", "rm", remote_path], manual_adb_path=manual_adb_path)
+        self.run_adb_command(
+            ["shell", "rm", remote_path],
+            device_serial=device.identifier,
+            manual_adb_path=manual_adb_path,
+        )
         return pull_result
 
     def _capture_success(

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QApplication,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -36,12 +37,27 @@ from app.services.internal_adb_flow_service import InternalADBFlowService
 from app.services.locale_preparation_service import LocalePreparationService
 from app.services.log_service import LogService
 from app.services.screenshot_service import ScreenshotService
+from app.services.settings_service import SettingsService
 from app.ui.components.progress_panel import ProgressPanel
 from app.ui.components.status_badge import StatusBadge
 from app.ui.workers import Worker
 
 
 class ScreenshotsPage(QWidget):
+    MODE_OPTIONS = {
+        "in_app_screen": [
+            ("Current language only", "none"),
+            ("App debug command", "app_debug_command"),
+            ("In-app recorded language flow", "in_app_recorded_language_flow"),
+            ("Combined: device + app language", "combined"),
+        ],
+        "widget_home_screen": [
+            ("Current language only", "none"),
+            ("Device language recorded flow", "device_language_recorded_flow"),
+            ("Combined: device + app language", "combined"),
+        ],
+    }
+
     def __init__(
         self,
         state: AppState,
@@ -49,6 +65,7 @@ class ScreenshotsPage(QWidget):
         adb_service: ADBService,
         screenshot_service: ScreenshotService,
         internal_flow_service: InternalADBFlowService,
+        settings_service: SettingsService,
         worker_pool,
     ) -> None:
         super().__init__()
@@ -57,13 +74,18 @@ class ScreenshotsPage(QWidget):
         self.adb_service = adb_service
         self.screenshot_service = screenshot_service
         self.internal_flow_service = internal_flow_service
+        self.settings_service = settings_service
         self.locale_preparation_service = LocalePreparationService(self.state.selected_project_path)
         self.worker_pool = worker_pool
         self.preview_labels: list[QLabel] = []
+        self.pending_locale_test_locales: list[str] = []
+        self.raw_command_preview_visible = False
         self.refreshing_flow_table = False
         self.refreshing_internal_flow_table = False
         self.refreshing_internal_step_table = False
         self.refreshing_locale_tables = False
+        self.refreshing_test_flow_selector = False
+        self.refreshing_test_locale_selector = False
         self._init_flows()
         self._init_ui()
 
@@ -103,12 +125,13 @@ class ScreenshotsPage(QWidget):
         setup_layout.setVerticalSpacing(12)
 
         self.device_selector = QComboBox()
+        self.device_selector.currentIndexChanged.connect(self.on_device_selection_changed)
         self.refresh_button = QPushButton("Refresh devices")
         self.refresh_button.setObjectName("secondaryButton")
         self.refresh_button.clicked.connect(self.on_refresh_devices)
         self.output_folder_input = QLineEdit()
         self.output_folder_input.setPlaceholderText("Folder for generated screenshot assets")
-        self.output_folder_input.setText(str(Path.home() / "PlayPulseScreenshots"))
+        self.output_folder_input.setText(self.state.screenshot_output_folder or str(Path.home() / "PlayPulseScreenshots"))
         self.browse_folder_button = QPushButton("Browse")
         self.browse_folder_button.setObjectName("secondaryButton")
         self.browse_folder_button.clicked.connect(self.on_browse_output_folder)
@@ -120,6 +143,10 @@ class ScreenshotsPage(QWidget):
                 "Discover app screens before capture",
             ]
         )
+        self.capture_target_selector = QComboBox()
+        self.capture_target_selector.addItems(["In-app screen", "Widget / Home screen"])
+        self.capture_target_selector.currentIndexChanged.connect(self._on_capture_target_changed)
+        self.capture_target_selector.currentIndexChanged.connect(self._update_locale_prep_warning)
         self.capture_backend_selector = QComboBox()
         self.capture_backend_selector.addItems(
             [
@@ -137,6 +164,23 @@ class ScreenshotsPage(QWidget):
         self.select_adb_button = QPushButton("Select adb.exe manually")
         self.select_adb_button.setObjectName("secondaryButton")
         self.select_adb_button.clicked.connect(self.on_select_adb)
+        self.save_adb_path_button = QPushButton("Save adb path")
+        self.reset_adb_path_button = QPushButton("Reset adb path")
+        self.test_adb_path_button = QPushButton("Test adb path")
+        self.auto_detect_adb_button = QPushButton("Auto-detect adb")
+        for adb_button in [self.auto_detect_adb_button, self.save_adb_path_button, self.reset_adb_path_button, self.test_adb_path_button]:
+            adb_button.setObjectName("secondaryButton")
+        self.auto_detect_adb_button.clicked.connect(self.on_run_adb_diagnostics)
+        self.save_adb_path_button.clicked.connect(self.on_save_adb_path)
+        self.reset_adb_path_button.clicked.connect(self.on_reset_adb_path)
+        self.test_adb_path_button.clicked.connect(self.on_test_adb_path)
+        self.adb_resolved_label = QLabel("Resolved adb path: Not detected")
+        self.adb_resolved_label.setObjectName("mutedText")
+        self.adb_source_label = QLabel("ADB path source: N/A")
+        self.adb_source_label.setObjectName("mutedText")
+        self.adb_path_note_label = QLabel("")
+        self.adb_path_note_label.setObjectName("helperText")
+        self.adb_path_note_label.setWordWrap(True)
         self.maestro_folder_input = QLineEdit()
         self.maestro_folder_input.setPlaceholderText("Folder with Maestro .yaml/.yml flows")
         if self.state.selected_project_path:
@@ -159,155 +203,39 @@ class ScreenshotsPage(QWidget):
             self.output_folder_input,
             self.browse_folder_button,
         )
-        scope_label = QLabel("Capture scope")
-        scope_label.setObjectName("fieldLabel")
-        backend_label = QLabel("Capture backend")
-        backend_label.setObjectName("fieldLabel")
-        setup_layout.addWidget(scope_label, 2, 0)
-        setup_layout.addWidget(self.capture_scope_selector, 2, 1, 1, 2)
-        setup_layout.addWidget(backend_label, 3, 0)
-        setup_layout.addWidget(self.capture_backend_selector, 3, 1, 1, 2)
-        setup_layout.addWidget(self.launch_before_capture_checkbox, 4, 1, 1, 2)
-        self._add_setup_row(
+        self.adb_path_label = self._add_setup_row(
             setup_layout,
-            5,
+            2,
             "Manual adb.exe path",
             self.adb_path_input,
             self.select_adb_button,
         )
-        self._add_setup_row(
+        adb_buttons_row = QHBoxLayout()
+        adb_buttons_row.setSpacing(8)
+        adb_buttons_row.addWidget(self.auto_detect_adb_button)
+        adb_buttons_row.addWidget(self.save_adb_path_button)
+        adb_buttons_row.addWidget(self.reset_adb_path_button)
+        adb_buttons_row.addWidget(self.test_adb_path_button)
+        setup_layout.addLayout(adb_buttons_row, 3, 1, 1, 2)
+        setup_layout.addWidget(self.adb_resolved_label, 4, 0, 1, 3)
+        setup_layout.addWidget(self.adb_source_label, 5, 0, 1, 3)
+        setup_layout.addWidget(self.adb_path_note_label, 6, 0, 1, 3)
+        self.maestro_label = self._add_setup_row(
             setup_layout,
-            6,
+            7,
             "Maestro flows folder",
             self.maestro_folder_input,
             self.browse_maestro_button,
         )
+        for maestro_widget in [self.maestro_label, self.maestro_folder_input, self.browse_maestro_button]:
+            maestro_widget.setVisible(False)
         setup_layout.setColumnStretch(1, 1)
-        main_layout.addWidget(setup_card)
-        main_layout.addWidget(self._build_locale_preparation_card())
+        self.steps_tabs = QTabWidget()
+        self.steps_tabs.setObjectName("stepsTabs")
 
-        workflow_card = QFrame()
-        workflow_card.setObjectName("card")
-        workflow_layout = QGridLayout(workflow_card)
-        workflow_layout.setContentsMargins(16, 16, 16, 16)
-        workflow_layout.setHorizontalSpacing(16)
-        workflow_layout.setVerticalSpacing(10)
-
-        flow_header = QHBoxLayout()
-        flows_title = QLabel("Screenshot flows")
-        flows_title.setObjectName("cardTitle")
-        self.discover_button = QPushButton("Discover screens")
-        self.add_flow_button = QPushButton("Add flow")
-        self.remove_flow_button = QPushButton("Remove selected")
-        self.reset_flows_button = QPushButton("Reset presets")
-        self.load_maestro_button = QPushButton("Load Maestro flows")
-        self.capture_selected_button = QPushButton("Capture selected now")
-        for button in [
-            self.discover_button,
-            self.add_flow_button,
-            self.remove_flow_button,
-            self.reset_flows_button,
-            self.load_maestro_button,
-            self.capture_selected_button,
-        ]:
-            button.setObjectName("secondaryButton")
-        self.discover_button.clicked.connect(self.on_discover_screens)
-        self.add_flow_button.clicked.connect(self.on_add_flow)
-        self.remove_flow_button.clicked.connect(self.on_remove_flow)
-        self.reset_flows_button.clicked.connect(self.on_reset_presets)
-        self.load_maestro_button.clicked.connect(self.on_load_maestro_flows)
-        self.capture_selected_button.clicked.connect(self.on_capture_selected_now)
-        flow_header.addWidget(flows_title)
-        flow_header.addStretch()
-        flow_header.addWidget(self.discover_button)
-        flow_header.addWidget(self.load_maestro_button)
-        flow_header.addWidget(self.add_flow_button)
-        flow_header.addWidget(self.remove_flow_button)
-        flow_header.addWidget(self.reset_flows_button)
-
-        self.flows_table = QTableWidget(0, 6)
-        self.flows_table.setMinimumHeight(320)
-        self.flows_table.setHorizontalHeaderLabels(
-            ["Enabled", "Flow name", "Description", "Expected screenshot name", "Status", "Automation"]
-        )
-        self.flows_table.verticalHeader().setVisible(False)
-        self.flows_table.setAlternatingRowColors(True)
-        self.flows_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.flows_table.setEditTriggers(
-            QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked
-        )
-        self.flows_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.flows_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.flows_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.flows_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.flows_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.flows_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.flows_table.itemChanged.connect(self.on_flow_item_changed)
-
-        locales_title = QLabel("Target locales")
-        locales_title.setObjectName("cardTitle")
-        self.locale_table = QTableWidget(0, 2)
-        self.locale_table.setMinimumHeight(320)
-        self.locale_table.setHorizontalHeaderLabels(["Locale", "Status"])
-        self.locale_table.verticalHeader().setVisible(False)
-        self.locale_table.setAlternatingRowColors(True)
-        self.locale_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.locale_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.locale_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.locale_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-
-        workflow_layout.addLayout(flow_header, 0, 0)
-        workflow_layout.addWidget(self.flows_table, 1, 0)
-        workflow_layout.addWidget(locales_title, 0, 1)
-        workflow_layout.addWidget(self.locale_table, 1, 1)
-        workflow_layout.setColumnStretch(0, 4)
-        workflow_layout.setColumnStretch(1, 1)
-        workflow_layout.setRowStretch(1, 1)
-        main_layout.addWidget(workflow_card)
-        main_layout.addWidget(self._build_internal_flow_card())
-
-        action_card = QFrame()
-        action_card.setObjectName("card")
-        action_layout = QHBoxLayout(action_card)
-        action_layout.setContentsMargins(16, 16, 16, 16)
-        action_layout.setSpacing(14)
-        self.capture_button = QPushButton("Run screenshot capture")
-        self.capture_button.clicked.connect(self.on_run_capture)
-        self.progress_panel = ProgressPanel("Screenshot progress")
-        action_layout.addWidget(self.capture_selected_button)
-        action_layout.addWidget(self.capture_button)
-        action_layout.addWidget(self.progress_panel, 1)
-        main_layout.addWidget(action_card)
-
-        checklist_card = QFrame()
-        checklist_card.setObjectName("card")
-        checklist_layout = QVBoxLayout(checklist_card)
-        checklist_layout.setContentsMargins(16, 16, 16, 16)
-        checklist_layout.setSpacing(8)
-        checklist_title = QLabel("Manual Capture Checklist")
-        checklist_title.setObjectName("cardTitle")
-        checklist_items = QLabel(
-            "\n".join(
-                [
-                    "[ ] Android emulator/device is running",
-                    "[ ] App is installed and visible on the device",
-                    "[ ] adb is detected",
-                    "[ ] Device appears as device, not offline or unauthorized",
-                    "[ ] Output folder is writable",
-                    "[ ] Navigate manually to the screen you want",
-                    "[ ] Select a flow name",
-                    "[ ] Click Capture selected now",
-                ]
-            )
-        )
-        checklist_items.setObjectName("helperText")
-        checklist_layout.addWidget(checklist_title)
-        checklist_layout.addWidget(checklist_items)
-        main_layout.addWidget(checklist_card)
-
-        diagnostics_card = QFrame()
-        diagnostics_card.setObjectName("card")
-        diagnostics_layout = QVBoxLayout(diagnostics_card)
+        self.diagnostics_card = QFrame()
+        self.diagnostics_card.setObjectName("card")
+        diagnostics_layout = QVBoxLayout(self.diagnostics_card)
         diagnostics_layout.setContentsMargins(16, 16, 16, 16)
         diagnostics_layout.setSpacing(10)
         diagnostics_title = QLabel("ADB Diagnostics")
@@ -340,14 +268,180 @@ class ScreenshotsPage(QWidget):
         diagnostics_layout.addWidget(diagnostics_title)
         diagnostics_layout.addLayout(diagnostics_buttons)
         diagnostics_layout.addWidget(self.diagnostics_view)
-        main_layout.addWidget(diagnostics_card)
+        self.diagnostics_card.setVisible(False)
+
+        device_page = QWidget()
+        device_layout = QVBoxLayout(device_page)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_layout.setSpacing(16)
+        device_layout.addWidget(setup_card)
+        device_layout.addWidget(self.diagnostics_card)
+        device_layout.addStretch()
+        self.steps_tabs.addTab(device_page, "Device & ADB")
+
+        capture_target_page = QWidget()
+        capture_target_layout = QVBoxLayout(capture_target_page)
+        capture_target_layout.setContentsMargins(0, 0, 0, 0)
+        capture_target_layout.setSpacing(16)
+        capture_target_layout.addWidget(self._build_capture_target_card())
+        capture_target_layout.addStretch()
+        self.steps_tabs.addTab(capture_target_page, "Capture Target")
+
+        language_page = QWidget()
+        language_layout = QVBoxLayout(language_page)
+        language_layout.setContentsMargins(0, 0, 0, 0)
+        language_layout.setSpacing(16)
+        language_layout.addWidget(self._build_locale_preparation_card())
+        language_layout.addStretch()
+        self.steps_tabs.addTab(language_page, "Language Preparation")
+
+        workflow_card = QFrame()
+        workflow_card.setObjectName("card")
+        workflow_layout = QGridLayout(workflow_card)
+        workflow_layout.setContentsMargins(16, 16, 16, 16)
+        workflow_layout.setHorizontalSpacing(16)
+        workflow_layout.setVerticalSpacing(10)
+
+        flow_header = QHBoxLayout()
+        flows_title = QLabel("Screenshot flows")
+        flows_title.setObjectName("cardTitle")
+        self.discover_button = QPushButton("Discover screens")
+        self.add_flow_button = QPushButton("Add flow")
+        self.remove_flow_button = QPushButton("Remove selected")
+        self.reset_flows_button = QPushButton("Reset presets")
+        self.load_maestro_button = QPushButton("Load Maestro flows")
+        self.capture_selected_button = QPushButton("Capture selected now")
+        for button in [
+            self.discover_button,
+            self.add_flow_button,
+            self.remove_flow_button,
+            self.reset_flows_button,
+            self.load_maestro_button,
+            self.capture_selected_button,
+        ]:
+            button.setObjectName("secondaryButton")
+        self.discover_button.clicked.connect(self.on_discover_screens)
+        self.add_flow_button.clicked.connect(self.on_add_flow)
+        self.remove_flow_button.clicked.connect(self.on_remove_flow)
+        self.reset_flows_button.clicked.connect(self.on_reset_presets)
+        self.load_maestro_button.clicked.connect(self.on_load_maestro_flows)
+        self.load_maestro_button.setVisible(False)
+        self.capture_selected_button.clicked.connect(self.on_capture_selected_now)
+        flow_header.addWidget(flows_title)
+        flow_header.addStretch()
+        flow_header.addWidget(self.discover_button)
+        flow_header.addWidget(self.load_maestro_button)
+        flow_header.addWidget(self.add_flow_button)
+        flow_header.addWidget(self.remove_flow_button)
+        flow_header.addWidget(self.reset_flows_button)
+
+        self.flows_table = QTableWidget(0, 6)
+        self.flows_table.setMinimumHeight(320)
+        self.flows_table.setHorizontalHeaderLabels(
+            ["Enabled", "Flow name", "Description", "Expected screenshot name", "Status", "Automation"]
+        )
+        self.flows_table.verticalHeader().setVisible(False)
+        self.flows_table.setAlternatingRowColors(True)
+        self.flows_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.flows_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked
+        )
+        self.flows_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.flows_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.flows_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.flows_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.flows_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.flows_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.flows_table.itemChanged.connect(self.on_flow_item_changed)
+        self.flows_table.itemSelectionChanged.connect(self._sync_test_flow_selector_from_table)
+
+        locales_title = QLabel("Target locales")
+        locales_title.setObjectName("cardTitle")
+        self.locale_table = QTableWidget(0, 2)
+        self.locale_table.setMinimumHeight(320)
+        self.locale_table.setHorizontalHeaderLabels(["Locale", "Status"])
+        self.locale_table.verticalHeader().setVisible(False)
+        self.locale_table.setAlternatingRowColors(True)
+        self.locale_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.locale_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.locale_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.locale_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.locale_table.itemSelectionChanged.connect(self._sync_test_locale_selector_from_table)
+
+        workflow_layout.addLayout(flow_header, 0, 0)
+        workflow_layout.addWidget(self.flows_table, 1, 0)
+        workflow_layout.addWidget(locales_title, 0, 1)
+        workflow_layout.addWidget(self.locale_table, 1, 1)
+        workflow_layout.setColumnStretch(0, 4)
+        workflow_layout.setColumnStretch(1, 1)
+        workflow_layout.setRowStretch(1, 1)
+
+        flows_page = QWidget()
+        flows_page_layout = QVBoxLayout(flows_page)
+        flows_page_layout.setContentsMargins(0, 0, 0, 0)
+        flows_page_layout.setSpacing(16)
+        flows_page_layout.addWidget(workflow_card)
+        flows_page_layout.addWidget(self._build_advanced_toggles_card())
+        self.internal_flow_card = self._build_internal_flow_card()
+        self.internal_flow_card.setVisible(False)
+        flows_page_layout.addWidget(self.internal_flow_card)
+        flows_page_layout.addStretch()
+        self.steps_tabs.addTab(flows_page, "Flows")
+
+        action_card = QFrame()
+        action_card.setObjectName("card")
+        action_layout = QHBoxLayout(action_card)
+        action_layout.setContentsMargins(16, 16, 16, 16)
+        action_layout.setSpacing(14)
+        self.capture_button = QPushButton("Run screenshot capture")
+        self.capture_button.clicked.connect(self.on_run_capture)
+        self.progress_panel = ProgressPanel("Screenshot progress")
+        action_layout.addWidget(self.capture_selected_button)
+        action_layout.addWidget(self.capture_button)
+        action_layout.addWidget(self.progress_panel, 1)
+
+        checklist_card = QFrame()
+        checklist_card.setObjectName("card")
+        checklist_layout = QVBoxLayout(checklist_card)
+        checklist_layout.setContentsMargins(16, 16, 16, 16)
+        checklist_layout.setSpacing(8)
+        checklist_title = QLabel("Manual Capture Checklist")
+        checklist_title.setObjectName("cardTitle")
+        checklist_items = QLabel(
+            "\n".join(
+                [
+                    "[ ] Android emulator/device is running",
+                    "[ ] App is installed and visible on the device",
+                    "[ ] adb is detected",
+                    "[ ] Device appears as device, not offline or unauthorized",
+                    "[ ] Output folder is writable",
+                    "[ ] Navigate manually to the screen you want",
+                    "[ ] Select a flow name",
+                    "[ ] Click Capture selected now",
+                ]
+            )
+        )
+        checklist_items.setObjectName("helperText")
+        checklist_layout.addWidget(checklist_title)
+        checklist_layout.addWidget(checklist_items)
+
+        test_capture_page = QWidget()
+        test_capture_layout = QVBoxLayout(test_capture_page)
+        test_capture_layout.setContentsMargins(0, 0, 0, 0)
+        test_capture_layout.setSpacing(16)
+        test_capture_layout.addWidget(self._build_locale_summary_card())
+        test_capture_layout.addWidget(self._build_manual_test_capture_card())
+        test_capture_layout.addWidget(action_card)
+        test_capture_layout.addWidget(checklist_card)
+        test_capture_layout.addStretch()
+        self.steps_tabs.addTab(test_capture_page, "Test & Capture")
 
         preview_card = QFrame()
         preview_card.setObjectName("card")
         preview_layout = QVBoxLayout(preview_card)
         preview_layout.setContentsMargins(16, 16, 16, 16)
         preview_layout.setSpacing(12)
-        preview_title = QLabel("Screenshot preview")
+        preview_title = QLabel("Screenshot results")
         preview_title.setObjectName("cardTitle")
         preview_grid = QGridLayout()
         preview_grid.setSpacing(12)
@@ -356,8 +450,23 @@ class ScreenshotsPage(QWidget):
             preview_grid.addWidget(card, index // 3, index % 3)
         preview_layout.addWidget(preview_title)
         preview_layout.addLayout(preview_grid)
-        main_layout.addWidget(preview_card)
-        main_layout.addStretch()
+
+        results_page = QWidget()
+        results_layout = QVBoxLayout(results_page)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(16)
+        results_layout.addWidget(preview_card)
+        open_output_row = QHBoxLayout()
+        self.open_output_folder_button = QPushButton("Open output folder")
+        self.open_output_folder_button.setObjectName("secondaryButton")
+        self.open_output_folder_button.clicked.connect(self.on_open_output_folder)
+        open_output_row.addWidget(self.open_output_folder_button)
+        open_output_row.addStretch()
+        results_layout.addLayout(open_output_row)
+        results_layout.addStretch()
+        self.steps_tabs.addTab(results_page, "Results")
+
+        main_layout.addWidget(self.steps_tabs)
 
         self.refresh_from_state()
         self.on_refresh_devices()
@@ -369,12 +478,166 @@ class ScreenshotsPage(QWidget):
         label_text: str,
         field: QWidget,
         button: QPushButton,
-    ) -> None:
+    ) -> QLabel:
         label = QLabel(label_text)
         label.setObjectName("fieldLabel")
         layout.addWidget(label, row, 0)
         layout.addWidget(field, row, 1)
         layout.addWidget(button, row, 2)
+        return label
+
+    def _build_locale_summary_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QGridLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setHorizontalSpacing(14)
+        layout.setVerticalSpacing(10)
+
+        title = QLabel("Localized capture readiness")
+        title.setObjectName("cardTitle")
+        self.locale_folder_notice = QLabel(
+            "Locale folders only control where screenshots are saved. They do not change the app or device language. "
+            "Configure and test Locale Preparation to capture real localized screenshots."
+        )
+        self.locale_folder_notice.setObjectName("helperText")
+        self.locale_folder_notice.setWordWrap(True)
+
+        self.summary_capture_target_label = QLabel("Capture target: In-app screen")
+        self.summary_language_label = QLabel("Language preparation: not configured")
+        self.summary_locales_label = QLabel("Selected locales: 0")
+        self.summary_ready_label = QLabel("Ready to capture: no")
+        self.summary_adb_label = QLabel("Resolved adb path: missing")
+        self.summary_device_label = QLabel("Selected device: none")
+
+        self.locale_readiness_table = QTableWidget(0, 5)
+        self.locale_readiness_table.setMinimumHeight(180)
+        self.locale_readiness_table.setHorizontalHeaderLabels(
+            ["Locale", "Preparation method", "Assigned command or flow", "Last test result", "Ready"]
+        )
+        self.locale_readiness_table.verticalHeader().setVisible(False)
+        self.locale_readiness_table.setAlternatingRowColors(True)
+        self.locale_readiness_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.locale_readiness_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.locale_readiness_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.locale_readiness_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.locale_readiness_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.locale_readiness_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.locale_readiness_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+
+        layout.addWidget(title, 0, 0, 1, 3)
+        layout.addWidget(self.locale_folder_notice, 1, 0, 1, 3)
+        layout.addWidget(self.summary_capture_target_label, 2, 0)
+        layout.addWidget(self.summary_language_label, 2, 1)
+        layout.addWidget(self.summary_locales_label, 2, 2)
+        layout.addWidget(self.summary_ready_label, 3, 0)
+        layout.addWidget(self.summary_adb_label, 3, 1)
+        layout.addWidget(self.summary_device_label, 3, 2)
+        layout.addWidget(self.locale_readiness_table, 4, 0, 1, 3)
+        return card
+
+    def _build_manual_test_capture_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QGridLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(10)
+
+        title = QLabel("Manual Test Capture")
+        title.setObjectName("cardTitle")
+        flow_label = QLabel("Screenshot flow")
+        flow_label.setObjectName("fieldLabel")
+        locale_label = QLabel("Locale")
+        locale_label.setObjectName("fieldLabel")
+
+        self.test_flow_selector = QComboBox()
+        self.test_flow_selector.currentIndexChanged.connect(self.on_test_flow_selection_changed)
+        self.test_locale_selector = QComboBox()
+        self.test_locale_selector.currentIndexChanged.connect(self.on_test_locale_selection_changed)
+        self.selected_flow_label = QLabel(
+            "No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."
+        )
+        self.selected_flow_label.setObjectName("helperText")
+        self.selected_flow_label.setWordWrap(True)
+        self.capture_current_language_test_button = QPushButton("Capture current language test")
+        self.capture_current_language_test_button.setObjectName("secondaryButton")
+        self.capture_current_language_test_button.clicked.connect(self.on_capture_current_language_test)
+
+        layout.addWidget(title, 0, 0, 1, 3)
+        layout.addWidget(flow_label, 1, 0)
+        layout.addWidget(self.test_flow_selector, 1, 1)
+        layout.addWidget(locale_label, 2, 0)
+        layout.addWidget(self.test_locale_selector, 2, 1)
+        layout.addWidget(self.capture_current_language_test_button, 1, 2, 2, 1)
+        layout.addWidget(self.selected_flow_label, 3, 0, 1, 3)
+        layout.setColumnStretch(1, 1)
+        return card
+
+    def _build_capture_target_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QGridLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(10)
+
+        title = QLabel("Capture Target")
+        title.setObjectName("cardTitle")
+        description = QLabel(
+            "Select whether you want in-app screen captures or widget/home screen captures. "
+            "In-app screens usually require app language preparation. Widget screenshots usually require device language preparation."
+        )
+        description.setObjectName("helperText")
+        description.setWordWrap(True)
+
+        target_label = QLabel("Screenshot target type")
+        target_label.setObjectName("fieldLabel")
+        backend_label = QLabel("Capture backend")
+        backend_label.setObjectName("fieldLabel")
+
+        layout.addWidget(title, 0, 0, 1, 2)
+        layout.addWidget(description, 1, 0, 1, 2)
+        layout.addWidget(target_label, 2, 0)
+        layout.addWidget(self.capture_target_selector, 2, 1)
+        layout.addWidget(backend_label, 3, 0)
+        layout.addWidget(self.capture_backend_selector, 3, 1)
+        layout.addWidget(self.launch_before_capture_checkbox, 4, 0, 1, 2)
+        layout.addWidget(self.capture_scope_selector, 5, 1)
+        return card
+
+    def _build_advanced_toggles_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Advanced tools")
+        title.setObjectName("cardTitle")
+        self.toggle_diagnostics_button = QPushButton("Show ADB Diagnostics")
+        self.toggle_flow_editor_button = QPushButton("Show Advanced Flow Editor")
+        self.toggle_maestro_button = QPushButton("Show Optional Maestro")
+        self.toggle_raw_preview_button = QPushButton("Show Raw Command Preview")
+        for button in [
+            self.toggle_diagnostics_button,
+            self.toggle_flow_editor_button,
+            self.toggle_maestro_button,
+            self.toggle_raw_preview_button,
+        ]:
+            button.setObjectName("secondaryButton")
+        self.toggle_diagnostics_button.clicked.connect(self.on_toggle_diagnostics)
+        self.toggle_flow_editor_button.clicked.connect(self.on_toggle_flow_editor)
+        self.toggle_maestro_button.clicked.connect(self.on_toggle_maestro_options)
+        self.toggle_raw_preview_button.clicked.connect(self.on_toggle_raw_command_preview)
+
+        layout.addWidget(title)
+        layout.addStretch()
+        layout.addWidget(self.toggle_diagnostics_button)
+        layout.addWidget(self.toggle_flow_editor_button)
+        layout.addWidget(self.toggle_maestro_button)
+        layout.addWidget(self.toggle_raw_preview_button)
+        return card
 
     def _build_preview_card(self) -> QFrame:
         card = QFrame()
@@ -413,26 +676,16 @@ class ScreenshotsPage(QWidget):
         title.setObjectName("cardTitle")
         layout.addWidget(title, 0, 0, 1, 3)
 
-        self.capture_target_selector = QComboBox()
-        self.capture_target_selector.addItems(["In-app screen", "Widget / Home screen"])
-        self.capture_target_selector.currentIndexChanged.connect(self._update_locale_prep_warning)
+        self.capture_target_summary_label = QLabel("Selected capture target: In-app screen")
+        self.capture_target_summary_label.setObjectName("mutedText")
 
         self.locale_preparation_mode_selector = QComboBox()
-        self.locale_preparation_mode_selector.addItems(
-            [
-                "None",
-                "App debug command",
-                "In-app recorded language flow",
-                "Device language command / assisted mode",
-                "Device language recorded flow",
-                "Combined mode",
-            ]
-        )
+        self._set_language_mode_options("in_app_screen")
         self.locale_preparation_mode_selector.currentIndexChanged.connect(self._update_locale_prep_warning)
         self.locale_preparation_mode_selector.currentIndexChanged.connect(self._update_locale_prep_visibility)
 
         layout.addWidget(QLabel("Capture target type"), 1, 0)
-        layout.addWidget(self.capture_target_selector, 1, 1, 1, 2)
+        layout.addWidget(self.capture_target_summary_label, 1, 1, 1, 2)
         layout.addWidget(QLabel("Locale preparation mode"), 2, 0)
         layout.addWidget(self.locale_preparation_mode_selector, 2, 1, 1, 2)
 
@@ -486,6 +739,9 @@ class ScreenshotsPage(QWidget):
         self.test_locale_prep_button = QPushButton("Test selected locale preparation")
         self.test_locale_prep_button.setObjectName("secondaryButton")
         self.test_locale_prep_button.clicked.connect(self.on_test_selected_locale_preparation)
+        self.test_all_locale_prep_button = QPushButton("Test all locales")
+        self.test_all_locale_prep_button.setObjectName("secondaryButton")
+        self.test_all_locale_prep_button.clicked.connect(self.on_test_all_locale_preparation)
 
         self.app_debug_type_label = QLabel("App debug command type")
         self.deep_link_label = QLabel("Deep link template")
@@ -504,7 +760,11 @@ class ScreenshotsPage(QWidget):
         layout.addWidget(self.broadcast_extra_value_label, 11, 0)
         layout.addWidget(self.broadcast_extra_value_input, 11, 1, 1, 2)
         layout.addWidget(self.app_command_preview, 12, 0, 1, 3)
-        layout.addWidget(self.test_locale_prep_button, 13, 0, 1, 3)
+        test_buttons = QHBoxLayout()
+        test_buttons.setSpacing(8)
+        test_buttons.addWidget(self.test_locale_prep_button)
+        test_buttons.addWidget(self.test_all_locale_prep_button)
+        layout.addLayout(test_buttons, 13, 0, 1, 3)
 
         self.app_language_flow_table = QTableWidget(0, 3)
         self.app_language_flow_table.setHorizontalHeaderLabels(["Locale", "App language flow", "Status"])
@@ -535,6 +795,10 @@ class ScreenshotsPage(QWidget):
         self.force_stop_checkbox.setChecked(True)
         self.relaunch_checkbox = QCheckBox("Relaunch app after locale preparation")
         self.relaunch_checkbox.setChecked(True)
+        self.open_locale_settings_before_device_flow_checkbox = QCheckBox(
+            "Open Android language settings before device flow"
+        )
+        self.open_locale_settings_before_device_flow_checkbox.setChecked(False)
         self.wait_after_input = QSpinBox()
         self.wait_after_input.setRange(0, 30)
         self.wait_after_input.setValue(2)
@@ -548,9 +812,10 @@ class ScreenshotsPage(QWidget):
         layout.addWidget(self.relaunch_checkbox, 18, 2)
         layout.addWidget(QLabel("Wait after locale preparation (s)"), 19, 0)
         layout.addWidget(self.wait_after_input, 19, 1)
-        layout.addWidget(self.go_home_before_widget_checkbox, 20, 0, 1, 2)
-        layout.addWidget(QLabel("Wait for widget render (s)"), 21, 0)
-        layout.addWidget(self.wait_widget_render_input, 21, 1)
+        layout.addWidget(self.open_locale_settings_before_device_flow_checkbox, 20, 0, 1, 3)
+        layout.addWidget(self.go_home_before_widget_checkbox, 21, 0, 1, 2)
+        layout.addWidget(QLabel("Wait for widget render (s)"), 22, 0)
+        layout.addWidget(self.wait_widget_render_input, 22, 1)
 
         self.save_locale_prep_button = QPushButton("Save locale preparation settings")
         self.save_locale_prep_button.setObjectName("secondaryButton")
@@ -565,24 +830,76 @@ class ScreenshotsPage(QWidget):
         self.capture_widget_button.setObjectName("secondaryButton")
         self.capture_widget_button.clicked.connect(self.on_capture_widget_now)
 
-        layout.addWidget(self.save_locale_prep_button, 22, 0, 1, 1)
-        layout.addWidget(self.load_locale_prep_button, 22, 1, 1, 1)
-        layout.addWidget(self.run_prep_only_button, 22, 2, 1, 1)
-        layout.addWidget(self.capture_widget_button, 23, 0, 1, 3)
+        layout.addWidget(self.save_locale_prep_button, 23, 0, 1, 1)
+        layout.addWidget(self.load_locale_prep_button, 23, 1, 1, 1)
+        layout.addWidget(self.run_prep_only_button, 23, 2, 1, 1)
+        layout.addWidget(self.capture_widget_button, 24, 0, 1, 3)
 
         self._update_locale_prep_visibility()
         self._populate_locale_mapping_tables()
         return card
 
-    def _update_locale_prep_visibility(self) -> None:
-        mode = self.locale_preparation_mode_selector.currentText()
-        app_mode = mode in {"App debug command", "Combined mode"}
-        app_flow_mode = mode in {"In-app recorded language flow", "Combined mode"}
-        device_flow_mode = mode in {
-            "Device language command / assisted mode",
-            "Device language recorded flow",
-            "Combined mode",
+    def _capture_target_value(self) -> str:
+        if self.capture_target_selector.currentText() == "Widget / Home screen":
+            return "widget_home_screen"
+        return "in_app_screen"
+
+    def _set_language_mode_options(self, capture_target_type: str, selected_mode: str = "") -> None:
+        previous_mode = selected_mode or self._mode_value_from_ui()
+        self.locale_preparation_mode_selector.blockSignals(True)
+        self.locale_preparation_mode_selector.clear()
+        for label, value in self.MODE_OPTIONS.get(capture_target_type, self.MODE_OPTIONS["in_app_screen"]):
+            self.locale_preparation_mode_selector.addItem(label, value)
+        index = self.locale_preparation_mode_selector.findData(previous_mode)
+        if index < 0:
+            index = 0
+        self.locale_preparation_mode_selector.setCurrentIndex(index)
+        self.locale_preparation_mode_selector.blockSignals(False)
+
+    def _on_capture_target_changed(self) -> None:
+        self._set_language_mode_options(self._capture_target_value())
+        self._update_capture_target_summary()
+        self._update_locale_prep_visibility()
+        self._update_locale_prep_warning()
+        self._update_locale_readiness()
+
+    def _update_capture_target_summary(self) -> None:
+        if hasattr(self, "capture_target_summary_label"):
+            self.capture_target_summary_label.setText(
+                f"Selected capture target: {self.capture_target_selector.currentText()}"
+            )
+
+    def _mode_value_from_ui(self) -> str:
+        value = self.locale_preparation_mode_selector.currentData()
+        if isinstance(value, str) and value:
+            return value
+        mode_map = {
+            "None": "none",
+            "Current language only": "none",
+            "App debug command": "app_debug_command",
+            "In-app recorded language flow": "in_app_recorded_language_flow",
+            "Device language command / assisted mode": "device_language_command_assisted",
+            "Device language recorded flow": "device_language_recorded_flow",
+            "Combined mode": "combined",
+            "Combined: device + app language": "combined",
         }
+        return mode_map.get(self.locale_preparation_mode_selector.currentText(), "none")
+
+    def _mode_label_from_value(self, capture_target_type: str, mode_value: str) -> str:
+        for label, value in self.MODE_OPTIONS.get(capture_target_type, self.MODE_OPTIONS["in_app_screen"]):
+            if value == mode_value:
+                return label
+        if mode_value == "device_language_command_assisted":
+            return "Device language recorded flow"
+        return "Current language only"
+
+    def _update_locale_prep_visibility(self) -> None:
+        mode = self._mode_value_from_ui()
+        self.state.locale_preparation_settings.capture_target_type = self._capture_target_value()
+        self.state.locale_preparation_settings.locale_preparation_mode = mode
+        app_mode = mode in {"app_debug_command", "combined"}
+        app_flow_mode = mode in {"in_app_recorded_language_flow", "combined"}
+        device_flow_mode = mode in {"device_language_command_assisted", "device_language_recorded_flow", "combined"}
         deep_link_mode = app_mode and self.app_debug_type_selector.currentText() == "Deep link"
         broadcast_mode = app_mode and self.app_debug_type_selector.currentText() == "Broadcast"
         self.app_debug_type_label.setVisible(app_mode)
@@ -595,32 +912,31 @@ class ScreenshotsPage(QWidget):
         self.broadcast_extra_key_input.setVisible(broadcast_mode)
         self.broadcast_extra_value_label.setVisible(broadcast_mode)
         self.broadcast_extra_value_input.setVisible(broadcast_mode)
-        self.app_command_preview.setVisible(app_mode)
+        self.app_command_preview.setVisible(app_mode and self.raw_command_preview_visible)
         self.test_locale_prep_button.setVisible(app_mode or app_flow_mode or device_flow_mode)
         self.app_mapping_title.setVisible(app_flow_mode)
         self.app_language_flow_table.setVisible(app_flow_mode)
         self.device_mapping_title.setVisible(device_flow_mode)
         self.device_language_flow_table.setVisible(device_flow_mode)
+        self.open_locale_settings_before_device_flow_checkbox.setVisible(device_flow_mode)
         self._update_preview_command()
+        self._update_locale_readiness()
 
     def _update_locale_prep_warning(self) -> None:
-        mode = self.locale_preparation_mode_selector.currentText()
-        target = self.capture_target_selector.currentText()
+        mode = self._mode_value_from_ui()
+        target = self._capture_target_value()
         warnings: list[str] = []
         selected_locales = [locale.code for locale in self.state.selected_locales]
-        if mode == "None" and len(selected_locales) > 1:
+        if mode == "none" and len(selected_locales) > 1:
             warnings.append(
                 "Multiple locales are selected, but no locale preparation is configured. All screenshots may be captured in the same language."
             )
-        if target == "Widget / Home screen" and mode not in {
-            "Device language recorded flow",
-            "Device language command / assisted mode",
-            "Combined mode",
-        }:
+        if target == "widget_home_screen" and mode not in {"device_language_recorded_flow", "combined"}:
             warnings.append(
                 "Widget screenshots may still use the current Android system language. Device language preparation is recommended for widgets."
             )
         self.locale_prep_warning_label.setText(" \n".join(warnings) if warnings else "")
+        self._update_locale_readiness()
 
     def _populate_locale_mapping_tables(self) -> None:
         selected_locales = [locale.code for locale in self.state.selected_locales]
@@ -645,20 +961,30 @@ class ScreenshotsPage(QWidget):
             status = "Assigned" if assigned_device else "Missing"
             self.device_language_flow_table.setItem(device_row, 3, QTableWidgetItem(status))
         self.refreshing_locale_tables = False
+        self._update_locale_readiness()
 
     def _update_preview_command(self) -> None:
         command_type = self.app_debug_type_selector.currentText()
         locale = self._selected_locale_for_prep() or "{locale}"
+        adb_path = self.adb_service.resolve_adb_path(self.state.manual_adb_path).path or "<adb.exe>"
+        device_serial = self._selected_device_serial() or "<device_serial>"
         if command_type == "Deep link":
             template = self.app_deep_link_input.text().strip() or "myapp://playpulse/set-locale?locale={locale}"
             deep_link = template.replace("{locale}", locale)
-            preview = f"adb shell am start -a android.intent.action.VIEW -d \"{deep_link}\""
+            self.state.locale_preparation_settings.app_debug_command.type = "deep_link"
+            self.state.locale_preparation_settings.app_debug_command.template = self.app_deep_link_input.text().strip()
+            preview = f"\"{adb_path}\" -s {device_serial} shell am start -a android.intent.action.VIEW -d \"{deep_link}\""
         else:
             action = self.broadcast_action_input.text().strip() or "com.example.app.PLAYPULSE_SET_LOCALE"
             extra_key = self.broadcast_extra_key_input.text().strip() or "locale"
             extra_value = self.broadcast_extra_value_input.text().strip() or "{locale}"
-            preview = f"adb shell am broadcast -a {action} --es {extra_key} {extra_value.replace('{locale}', locale)}"
+            self.state.locale_preparation_settings.app_debug_command.type = "broadcast"
+            self.state.locale_preparation_settings.app_debug_command.action = self.broadcast_action_input.text().strip()
+            self.state.locale_preparation_settings.app_debug_command.extra_key = extra_key
+            self.state.locale_preparation_settings.app_debug_command.extra_value = extra_value
+            preview = f"\"{adb_path}\" -s {device_serial} shell am broadcast -a {action} --es {extra_key} {extra_value.replace('{locale}', locale)}"
         self.app_command_preview.setText(preview)
+        self._update_locale_readiness()
 
     def _selected_locale_for_prep(self) -> str | None:
         if hasattr(self, "locale_table"):
@@ -669,22 +995,166 @@ class ScreenshotsPage(QWidget):
             return self.state.selected_locales[0].code
         return None
 
+    def _selected_locale_codes_for_capture(self) -> list[str]:
+        locales = self._selected_locales_from_table()
+        if locales:
+            return locales
+        return [locale.code for locale in self.state.selected_locales]
+
+    def _validate_locale_preparation_for(self, locales: list[str]):
+        self._save_locale_preparation_settings_to_state()
+        validation = self.locale_preparation_service.validate_locale_preparation(
+            self.state.locale_preparation_settings,
+            locales,
+            self.state.locale_preparation_settings.capture_target_type,
+        )
+        self._append_locale_option_blockers(validation)
+        return validation
+
+    def _append_locale_option_blockers(self, validation) -> None:
+        settings = self.state.locale_preparation_settings
+        options = settings.common_options
+        if (
+            settings.locale_preparation_mode != "none"
+            and (options.force_stop_after_locale_change or options.relaunch_after_locale_change)
+            and not self.state.detected_package_name.strip()
+        ):
+            validation.blocking_errors.append(
+                "Package name is required for force stop/relaunch. Scan the Android project first or disable these options."
+            )
+            validation.is_ready = False
+
+    def _block_if_locale_preparation_not_ready(self, locales: list[str]) -> bool:
+        validation = self._validate_locale_preparation_for(locales)
+        self._apply_locale_validation_to_ui(validation)
+        for warning in validation.warnings:
+            self.log_service.warning(warning)
+        if validation.is_ready:
+            return False
+        self._show_blocking_reasons(validation.blocking_errors, "Locale prep needed")
+        return True
+
+    def _show_blocking_reasons(self, reasons: list[str], badge_text: str = "Blocked") -> None:
+        if not reasons:
+            return
+        for reason in reasons:
+            self.log_service.warning(reason)
+        self.status_badge.set_status("warning", badge_text)
+        self.progress_panel.set_status("; ".join(reasons), 0)
+
+    def _capture_blocking_reasons(
+        self,
+        flows: list[ScreenshotFlow],
+        locales: list[str],
+        backend: str,
+        validate_locale_preparation: bool = True,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if not flows:
+            reasons.append(
+                "No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."
+            )
+
+        if not self._selected_device():
+            reasons.append("No device selected.")
+
+        if not locales:
+            reasons.append("No locale selected.")
+
+        output_folder = self.output_folder_input.text().strip()
+        if not output_folder or not self.adb_service.is_output_folder_writable(output_folder):
+            reasons.append("Output folder not writable.")
+
+        if backend in {"Real ADB screencap", "Maestro flow + ADB screencap"}:
+            path_info = self.adb_service.resolve_adb_path(self.state.manual_adb_path)
+            if not path_info.found:
+                reasons.append("ADB path invalid.")
+
+        if backend == "Maestro flow + ADB screencap" and any(not flow.automation_path for flow in flows):
+            reasons.append("Maestro capture requires flows loaded from .yaml or .yml files.")
+
+        if self.launch_before_capture_checkbox.isChecked() and not self.state.detected_package_name.strip():
+            reasons.append(
+                "Package name is required for launch-before-capture. Scan the Android project first or disable this option."
+            )
+
+        settings = self.state.locale_preparation_settings
+        options = settings.common_options
+        if (
+            settings.locale_preparation_mode != "none"
+            and (options.force_stop_after_locale_change or options.relaunch_after_locale_change)
+            and not self.state.detected_package_name.strip()
+        ):
+            reasons.append(
+                "Package name is required for force stop/relaunch. Scan the Android project first or disable these options."
+            )
+
+        if validate_locale_preparation and locales:
+            validation = self._validate_locale_preparation_for(locales)
+            self._apply_locale_validation_to_ui(validation)
+            for warning in validation.warnings:
+                self.log_service.warning(warning)
+            reasons.extend(validation.blocking_errors)
+
+        return list(dict.fromkeys(reasons))
+
+    def _apply_locale_validation_to_ui(self, validation) -> None:
+        self.locale_prep_warning_label.setText(
+            "\n".join(validation.blocking_errors + validation.warnings)
+        )
+        self.locale_readiness_table.setRowCount(0)
+        for status in validation.per_locale_status:
+            row = self.locale_readiness_table.rowCount()
+            self.locale_readiness_table.insertRow(row)
+            locale = status.get("locale", "")
+            test_result = self.state.locale_preparation_test_results.get(locale, "Not tested")
+            self.locale_readiness_table.setItem(row, 0, QTableWidgetItem(locale))
+            self.locale_readiness_table.setItem(row, 1, QTableWidgetItem(status.get("method", "")))
+            self.locale_readiness_table.setItem(row, 2, QTableWidgetItem(status.get("assigned", "")))
+            self.locale_readiness_table.setItem(row, 3, QTableWidgetItem(test_result))
+            self.locale_readiness_table.setItem(row, 4, QTableWidgetItem(status.get("ready", "")))
+        self._update_locale_summary(validation)
+
+    def _update_locale_readiness(self) -> None:
+        if not hasattr(self, "locale_readiness_table"):
+            return
+        locales = [locale.code for locale in self.state.selected_locales]
+        validation = self.locale_preparation_service.validate_locale_preparation(
+            self.state.locale_preparation_settings,
+            locales,
+            self._capture_target_value() if hasattr(self, "capture_target_selector") else "in_app_screen",
+        )
+        self._append_locale_option_blockers(validation)
+        self._apply_locale_validation_to_ui(validation)
+
+    def _update_locale_summary(self, validation) -> None:
+        if not hasattr(self, "summary_capture_target_label"):
+            return
+        target_label = self.capture_target_selector.currentText() if hasattr(self, "capture_target_selector") else "In-app screen"
+        mode_label = self.locale_preparation_mode_selector.currentText() if hasattr(self, "locale_preparation_mode_selector") else "Current language only"
+        locales = [
+            status.get("locale", "")
+            for status in getattr(validation, "per_locale_status", [])
+            if status.get("locale", "")
+        ]
+        if not locales:
+            locales = [locale.code for locale in self.state.selected_locales]
+        path_info = self.adb_service.resolve_adb_path(self.state.manual_adb_path)
+        device_serial = self._selected_device_serial()
+        configured = "configured" if self._mode_value_from_ui() != "none" else "not configured"
+        self.summary_capture_target_label.setText(f"Capture target: {target_label}")
+        self.summary_language_label.setText(f"Language preparation: {configured} ({mode_label})")
+        self.summary_locales_label.setText(f"Selected locales: {len(locales)}")
+        self.summary_ready_label.setText(f"Ready to capture: {'yes' if validation.is_ready else 'no'}")
+        self.summary_adb_label.setText(f"Resolved adb path: {'valid' if path_info.found else 'missing'}")
+        self.summary_device_label.setText(f"Selected device: {device_serial or 'none'}")
+
     def _apply_locale_preparation_settings_state(self) -> None:
         settings = self.state.locale_preparation_settings
         self.capture_target_selector.setCurrentText(
             "Widget / Home screen" if settings.capture_target_type == "widget_home_screen" else "In-app screen"
         )
-        mode_map = {
-            "none": "None",
-            "app_debug_command": "App debug command",
-            "in_app_recorded_language_flow": "In-app recorded language flow",
-            "device_language_command_assisted": "Device language command / assisted mode",
-            "device_language_recorded_flow": "Device language recorded flow",
-            "combined": "Combined mode",
-        }
-        self.locale_preparation_mode_selector.setCurrentText(
-            mode_map.get(settings.locale_preparation_mode, "None")
-        )
+        self._set_language_mode_options(settings.capture_target_type, settings.locale_preparation_mode)
         self.app_debug_type_selector.setCurrentText(
             "Deep link" if settings.app_debug_command.type == "deep_link" else "Broadcast"
         )
@@ -696,28 +1166,21 @@ class ScreenshotsPage(QWidget):
         self.force_stop_checkbox.setChecked(options.force_stop_after_locale_change)
         self.relaunch_checkbox.setChecked(options.relaunch_after_locale_change)
         self.wait_after_input.setValue(options.wait_after_locale_change_seconds)
+        self.open_locale_settings_before_device_flow_checkbox.setChecked(
+            options.open_locale_settings_before_device_flow
+        )
         self.go_home_before_widget_checkbox.setChecked(options.go_home_before_widget_capture)
         self.wait_widget_render_input.setValue(options.wait_for_widget_render_seconds)
         self._populate_locale_mapping_tables()
         self._update_locale_prep_warning()
         self._update_locale_prep_visibility()
         self._update_preview_command()
+        self._update_locale_readiness()
 
     def _save_locale_preparation_settings_to_state(self) -> None:
         settings = self.state.locale_preparation_settings
-        settings.capture_target_type = (
-            "widget_home_screen" if self.capture_target_selector.currentText() == "Widget / Home screen" else "in_app_screen"
-        )
-        mode_value = self.locale_preparation_mode_selector.currentText()
-        mode_map = {
-            "None": "none",
-            "App debug command": "app_debug_command",
-            "In-app recorded language flow": "in_app_recorded_language_flow",
-            "Device language command / assisted mode": "device_language_command_assisted",
-            "Device language recorded flow": "device_language_recorded_flow",
-            "Combined mode": "combined",
-        }
-        settings.locale_preparation_mode = mode_map.get(mode_value, "none")
+        settings.capture_target_type = self._capture_target_value()
+        settings.locale_preparation_mode = self._mode_value_from_ui()
         settings.app_debug_command.type = "deep_link" if self.app_debug_type_selector.currentText() == "Deep link" else "broadcast"
         settings.app_debug_command.template = self.app_deep_link_input.text().strip()
         settings.app_debug_command.action = self.broadcast_action_input.text().strip()
@@ -726,8 +1189,12 @@ class ScreenshotsPage(QWidget):
         settings.common_options.force_stop_after_locale_change = self.force_stop_checkbox.isChecked()
         settings.common_options.relaunch_after_locale_change = self.relaunch_checkbox.isChecked()
         settings.common_options.wait_after_locale_change_seconds = self.wait_after_input.value()
+        settings.common_options.open_locale_settings_before_device_flow = (
+            self.open_locale_settings_before_device_flow_checkbox.isChecked()
+        )
         settings.common_options.go_home_before_widget_capture = self.go_home_before_widget_checkbox.isChecked()
         settings.common_options.wait_for_widget_render_seconds = self.wait_widget_render_input.value()
+        self._update_locale_readiness()
 
     def on_detect_android_version(self) -> None:
         device = self._selected_device()
@@ -735,6 +1202,7 @@ class ScreenshotsPage(QWidget):
             self.status_badge.set_status("warning", "No devices")
             self.log_service.warning("No device selected for Android version detection.")
             return
+        self._sync_adb_path()
         self.detect_android_button.setEnabled(False)
         worker = Worker(self._detect_android_info, device.identifier, self.state.manual_adb_path)
         worker.signals.finished.connect(self.on_android_info_detected)
@@ -805,6 +1273,11 @@ class ScreenshotsPage(QWidget):
         manual_adb_path: str,
         progress_callback=None,
     ) -> None:
+        mode_label = self._mode_label_from_value(
+            self.state.locale_preparation_settings.capture_target_type,
+            self.state.locale_preparation_settings.locale_preparation_mode,
+        )
+        self.log_service.info(f"Running {mode_label} for {locale}.")
         self.screenshot_service.prepare_locale(
             device,
             locale,
@@ -828,12 +1301,60 @@ class ScreenshotsPage(QWidget):
             self.log_service.warning("No device selected for locale preparation.")
             self.status_badge.set_status("warning", "No devices")
             return
+        validation = self._validate_locale_preparation_for([locale])
+        self._apply_locale_validation_to_ui(validation)
+        if not validation.is_ready:
+            for error in validation.blocking_errors:
+                self.log_service.warning(error)
+            self.status_badge.set_status("warning", "Locale prep needed")
+            return
         self._sync_adb_path()
         self.test_locale_prep_button.setEnabled(False)
+        self.test_all_locale_prep_button.setEnabled(False)
+        self.pending_locale_test_locales = [locale]
         self.status_badge.set_status("info", "Testing")
+        self.log_service.info(f"Preparing {locale}")
         worker = Worker(
             self._run_locale_preparation,
             locale,
+            device,
+            self.output_folder_input.text().strip(),
+            self.state.manual_adb_path,
+            progress_callback=None,
+        )
+        worker.signals.progress.connect(self.on_capture_progress)
+        worker.signals.finished.connect(self.on_locale_preparation_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def on_test_all_locale_preparation(self) -> None:
+        self._save_locale_preparation_settings_to_state()
+        locales = self._selected_locale_codes_for_capture()
+        if not locales:
+            self.log_service.warning("No locales selected for locale preparation testing.")
+            self.status_badge.set_status("warning", "No locales")
+            return
+        device = self._selected_device()
+        if not device:
+            self.log_service.warning("No device selected for locale preparation testing.")
+            self.status_badge.set_status("warning", "No devices")
+            return
+        validation = self._validate_locale_preparation_for(locales)
+        self._apply_locale_validation_to_ui(validation)
+        if not validation.is_ready:
+            for error in validation.blocking_errors:
+                self.log_service.warning(error)
+            self.status_badge.set_status("warning", "Locale prep needed")
+            return
+        self._sync_adb_path()
+        self.pending_locale_test_locales = list(locales)
+        self.test_locale_prep_button.setEnabled(False)
+        self.test_all_locale_prep_button.setEnabled(False)
+        self.run_prep_only_button.setEnabled(False)
+        self.status_badge.set_status("info", "Testing locales")
+        worker = Worker(
+            self._prepare_all_locales,
+            locales,
             device,
             self.output_folder_input.text().strip(),
             self.state.manual_adb_path,
@@ -856,10 +1377,14 @@ class ScreenshotsPage(QWidget):
             self.log_service.warning("No device selected for locale preparation.")
             self.status_badge.set_status("warning", "No devices")
             return
+        if self._block_if_locale_preparation_not_ready(locales):
+            return
         self._sync_adb_path()
         self.capture_button.setEnabled(False)
         self.run_prep_only_button.setEnabled(False)
         self.test_locale_prep_button.setEnabled(False)
+        self.test_all_locale_prep_button.setEnabled(False)
+        self.pending_locale_test_locales = list(locales)
         self.status_badge.set_status("info", "Running preparation")
         worker = Worker(
             self._prepare_all_locales,
@@ -898,6 +1423,8 @@ class ScreenshotsPage(QWidget):
         self._save_locale_preparation_settings_to_state()
         try:
             path = self.locale_preparation_service.save_settings(self.state.locale_preparation_settings)
+            self.state.locale_preparation_settings_path = path
+            self.settings_service.save_locale_preparation_settings_path(path)
             self.status_badge.set_status("success", "Settings saved")
             self.log_service.success(f"Locale preparation settings saved to {path}.")
         except Exception as error:
@@ -906,6 +1433,8 @@ class ScreenshotsPage(QWidget):
     def on_load_locale_preparation_settings(self) -> None:
         if self.state.selected_project_path:
             path = self.locale_preparation_service.default_settings_path()
+        elif self.state.locale_preparation_settings_path:
+            path = self.state.locale_preparation_settings_path
         else:
             path, _ = QFileDialog.getOpenFileName(self, "Load locale preparation settings", filter="JSON files (*.json)")
         if not path:
@@ -913,6 +1442,8 @@ class ScreenshotsPage(QWidget):
         try:
             settings = self.locale_preparation_service.load_settings(path)
             self.state.locale_preparation_settings = settings
+            self.state.locale_preparation_settings_path = path
+            self.settings_service.save_locale_preparation_settings_path(path)
             self._apply_locale_preparation_settings_state()
             self.status_badge.set_status("success", "Settings loaded")
             self.log_service.success(f"Locale preparation settings loaded from {path}.")
@@ -936,8 +1467,10 @@ class ScreenshotsPage(QWidget):
                         "current": index,
                         "total": total,
                     }
-                )
+            )
+            self.log_service.info(f"Preparing {locale}")
             self._run_locale_preparation(locale, device, output_folder, manual_adb_path, progress_callback)
+            self.log_service.success(f"Finished preparation for {locale}")
 
     def _run_single_internal_flow_with_preparation(
         self,
@@ -1006,8 +1539,13 @@ class ScreenshotsPage(QWidget):
     def on_locale_preparation_finished(self, result: object) -> None:
         self.capture_button.setEnabled(True)
         self.test_locale_prep_button.setEnabled(True)
+        self.test_all_locale_prep_button.setEnabled(True)
         self.run_prep_only_button.setEnabled(True)
         self.capture_widget_button.setEnabled(True)
+        for locale in self.pending_locale_test_locales:
+            self.state.locale_preparation_test_results[locale] = "Succeeded"
+        self.pending_locale_test_locales = []
+        self._update_locale_readiness()
         self.status_badge.set_status("success", "Locale preparation complete")
         self.progress_panel.set_status("Locale preparation completed", 100)
         self.log_service.success("Locale preparation completed.")
@@ -1026,6 +1564,7 @@ class ScreenshotsPage(QWidget):
         status_item = self.app_language_flow_table.item(row, 2)
         if status_item:
             status_item.setText("Assigned" if item.text().strip() else "Missing")
+        self._update_locale_readiness()
 
     def on_device_language_flow_item_changed(self, item: QTableWidgetItem) -> None:
         if self.refreshing_locale_tables:
@@ -1041,6 +1580,7 @@ class ScreenshotsPage(QWidget):
         status_item = self.device_language_flow_table.item(row, 3)
         if status_item:
             status_item.setText("Assigned" if item.text().strip() else "Missing")
+        self._update_locale_readiness()
 
     def _build_internal_flow_card(self) -> QFrame:
         card = QFrame()
@@ -1171,6 +1711,8 @@ class ScreenshotsPage(QWidget):
         self.locale_preparation_service.project_path = self.state.selected_project_path or Path.cwd().as_posix()
         if self.state.manual_adb_path and self.adb_path_input.text().strip() != self.state.manual_adb_path:
             self.adb_path_input.setText(self.state.manual_adb_path)
+        if self.state.screenshot_output_folder and self.output_folder_input.text().strip() != self.state.screenshot_output_folder:
+            self.output_folder_input.setText(self.state.screenshot_output_folder)
         if self.state.selected_project_path and not self.maestro_folder_input.text().strip():
             self.maestro_folder_input.setText(str(Path(self.state.selected_project_path) / ".maestro"))
         workspace_flow_folder = self.internal_flow_service.default_flows_folder("")
@@ -1189,6 +1731,7 @@ class ScreenshotsPage(QWidget):
         self.refresh_internal_step_table()
         self.refresh_locale_table()
         self._apply_locale_preparation_settings_state()
+        self._update_locale_readiness()
         if self.state.screenshot_results:
             self.status_badge.set_status("success", "Captured")
             self._update_preview_cards()
@@ -1201,6 +1744,8 @@ class ScreenshotsPage(QWidget):
         selected = QFileDialog.getExistingDirectory(self, "Select screenshot output folder")
         if selected:
             self.output_folder_input.setText(selected)
+            self.state.screenshot_output_folder = selected
+            self.settings_service.save_screenshot_output_folder(selected)
 
     def on_browse_maestro_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select Maestro flows folder")
@@ -1217,8 +1762,54 @@ class ScreenshotsPage(QWidget):
             self.adb_path_input.setText(selected)
             self.state.manual_adb_path = selected
             self.adb_service.set_manual_adb_path(selected)
+            self.settings_service.save_adb_path(selected)
             self.log_service.info(f"Manual adb path selected: {selected}")
             self.on_run_adb_diagnostics()
+
+    def on_save_adb_path(self) -> None:
+        path = self.adb_path_input.text().strip()
+        if not path:
+            self.log_service.warning("Select an adb.exe path before saving it.")
+            self.status_badge.set_status("warning", "ADB path needed")
+            return
+        if not Path(path).expanduser().is_file():
+            self.log_service.warning("The selected adb.exe path does not exist.")
+            self.status_badge.set_status("warning", "ADB path invalid")
+            return
+        self.state.manual_adb_path = path
+        self.adb_service.set_manual_adb_path(path)
+        self.settings_service.save_adb_path(path)
+        self.status_badge.set_status("success", "ADB path saved")
+        self.log_service.success(f"ADB path saved: {path}")
+        self.on_run_adb_diagnostics()
+
+    def on_reset_adb_path(self) -> None:
+        self.settings_service.reset_adb_path()
+        self.state.manual_adb_path = ""
+        self.adb_path_input.clear()
+        self.adb_service.set_manual_adb_path("")
+        self.status_badge.set_status("info", "ADB path reset")
+        self.log_service.info("Saved adb path reset. PlayPulse will resolve adb again.")
+        self.on_run_adb_diagnostics()
+
+    def on_test_adb_path(self) -> None:
+        self._sync_adb_path()
+        self.test_adb_path_button.setEnabled(False)
+        self.status_badge.set_status("info", "Testing ADB")
+        worker = Worker(
+            self.adb_service.run_diagnostics,
+            self.state.manual_adb_path,
+            self._selected_device_serial(),
+            self.capture_backend_selector.currentText(),
+            self.output_folder_input.text().strip(),
+        )
+        worker.signals.finished.connect(self.on_adb_path_test_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def on_adb_path_test_finished(self, diagnostics) -> None:
+        self.test_adb_path_button.setEnabled(True)
+        self.on_adb_diagnostics_finished(diagnostics)
 
     def on_refresh_devices(self) -> None:
         self.refresh_button.setEnabled(False)
@@ -1245,7 +1836,22 @@ class ScreenshotsPage(QWidget):
         else:
             self.status_badge.set_status("info", "Ready")
             self.log_service.success("Connected devices refreshed.")
+            saved_serial = self.state.last_selected_device_serial
+            if saved_serial:
+                index = self.device_selector.findData(saved_serial)
+                if index >= 0:
+                    self.device_selector.setCurrentIndex(index)
         self._update_diagnostics_from_service()
+        self._update_locale_readiness()
+
+    def on_device_selection_changed(self) -> None:
+        serial = self._selected_device_serial()
+        if not serial:
+            return
+        self.state.last_selected_device_serial = serial
+        self.settings_service.save_last_selected_device_serial(serial)
+        self._update_preview_command()
+        self._update_locale_readiness()
 
     def on_discover_screens(self) -> None:
         self.discover_button.setEnabled(False)
@@ -1333,29 +1939,45 @@ class ScreenshotsPage(QWidget):
         self.log_service.success(f"Loaded {len(flows)} Maestro flows.")
 
     def on_capture_selected_now(self) -> None:
-        if not self.state.connected_devices:
-            self.log_service.warning("No connected device available for screenshot capture.")
-            self.status_badge.set_status("warning", "No devices")
-            return
         if self.capture_backend_selector.currentText() == "Internal ADB Flow Engine":
             self.on_run_internal_flow()
             return
 
-        flows = self._selected_flows_from_table()
+        flows = self._selected_flows_for_capture()
         if not flows:
-            self.log_service.warning("Select one or more screenshot flow rows before capturing.")
-            self.status_badge.set_status("warning", "Select flow")
+            self._show_blocking_reasons(
+                ["No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."],
+                "Select flow",
+            )
             return
 
         locales = self._selected_locales_from_table()
         if not locales:
             locales = [locale.code for locale in self.state.selected_locales]
         if not locales:
-            self.log_service.warning("No target locales selected for screenshots.")
-            self.status_badge.set_status("warning", "No locales")
+            self._show_blocking_reasons(["No locale selected."], "No locales")
             return
 
         self._start_capture(flows, locales)
+
+    def on_capture_current_language_test(self) -> None:
+        flow = self._flow_from_test_selector()
+        locale = self._locale_from_test_selector()
+        if not flow:
+            self._show_blocking_reasons(
+                ["No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."],
+                "Select flow",
+            )
+            return
+        if not locale:
+            self._show_blocking_reasons(["No locale selected."], "No locales")
+            return
+        none_index = self.locale_preparation_mode_selector.findData("none")
+        if none_index >= 0:
+            self.locale_preparation_mode_selector.setCurrentIndex(none_index)
+        self.capture_backend_selector.setCurrentText("Real ADB screencap")
+        self._save_locale_preparation_settings_to_state()
+        self._start_capture([flow], [locale])
 
     def on_run_adb_diagnostics(self) -> None:
         self._sync_adb_path()
@@ -1374,6 +1996,11 @@ class ScreenshotsPage(QWidget):
 
     def on_adb_diagnostics_finished(self, diagnostics) -> None:
         self.run_diagnostics_button.setEnabled(True)
+        if diagnostics.adb_found and diagnostics.adb_path:
+            self.state.manual_adb_path = diagnostics.adb_path
+            self.adb_service.set_manual_adb_path(diagnostics.adb_path)
+            if self.adb_path_input.text().strip() != diagnostics.adb_path:
+                self.adb_path_input.setText(diagnostics.adb_path)
         self._show_diagnostics(diagnostics)
         if diagnostics.adb_found and diagnostics.connected_devices_count > 0:
             self.status_badge.set_status("success", "ADB ready")
@@ -1441,6 +2068,33 @@ class ScreenshotsPage(QWidget):
             text = self.state.last_adb_diagnostics_text
         QApplication.clipboard().setText(text)
         self.log_service.info("ADB diagnostics copied to clipboard.")
+
+    def on_toggle_diagnostics(self) -> None:
+        visible = not self.diagnostics_card.isVisible()
+        self.diagnostics_card.setVisible(visible)
+        self.toggle_diagnostics_button.setText("Hide ADB Diagnostics" if visible else "Show ADB Diagnostics")
+        if visible:
+            self.on_run_adb_diagnostics()
+
+    def on_toggle_flow_editor(self) -> None:
+        visible = not self.internal_flow_card.isVisible()
+        self.internal_flow_card.setVisible(visible)
+        self.toggle_flow_editor_button.setText(
+            "Hide Advanced Flow Editor" if visible else "Show Advanced Flow Editor"
+        )
+
+    def on_toggle_maestro_options(self) -> None:
+        visible = not self.maestro_folder_input.isVisible()
+        for widget in [self.maestro_label, self.maestro_folder_input, self.browse_maestro_button, self.load_maestro_button]:
+            widget.setVisible(visible)
+        self.toggle_maestro_button.setText("Hide Optional Maestro" if visible else "Show Optional Maestro")
+
+    def on_toggle_raw_command_preview(self) -> None:
+        self.raw_command_preview_visible = not self.raw_command_preview_visible
+        self.toggle_raw_preview_button.setText(
+            "Hide Raw Command Preview" if self.raw_command_preview_visible else "Show Raw Command Preview"
+        )
+        self._update_locale_prep_visibility()
 
     def on_load_internal_flows(self) -> None:
         folder = self.internal_flows_folder_input.text().strip()
@@ -1572,7 +2226,9 @@ class ScreenshotsPage(QWidget):
         context = self._internal_run_context()
         flow = self._selected_internal_flow()
         step_index = self._selected_internal_step_index()
-        if not context or not flow or step_index is None:
+        if not context:
+            return
+        if not flow or step_index is None:
             self.log_service.warning("Select a device, flow, and step before running an internal ADB step.")
             return
         device, output_folder, locales = context
@@ -1600,10 +2256,14 @@ class ScreenshotsPage(QWidget):
         self._save_locale_preparation_settings_to_state()
         context = self._internal_run_context()
         flow = self._selected_internal_flow()
-        if not context or not flow:
-            self.log_service.warning("Select a device and an internal ADB flow before running it.")
+        if not context:
+            return
+        if not flow:
+            self.log_service.warning("Select an internal ADB flow before running it.")
             return
         device, output_folder, locales = context
+        if self._block_if_locale_preparation_not_ready(locales):
+            return
         self._set_internal_buttons_enabled(False)
         self.status_badge.set_status("info", "Running")
         self.progress_panel.reset(f"Running internal flow: {flow.name}")
@@ -1624,7 +2284,6 @@ class ScreenshotsPage(QWidget):
         self._save_locale_preparation_settings_to_state()
         context = self._internal_run_context()
         if not context:
-            self.log_service.warning("Select a device before running internal ADB flows.")
             return
         enabled_flows = self._enabled_internal_flows_from_table()
         if not enabled_flows:
@@ -1632,6 +2291,8 @@ class ScreenshotsPage(QWidget):
             self.status_badge.set_status("warning", "No flows")
             return
         device, output_folder, locales = context
+        if self._block_if_locale_preparation_not_ready(locales):
+            return
         self._set_internal_buttons_enabled(False)
         self.status_badge.set_status("info", "Running")
         self.progress_panel.reset("Running all enabled internal ADB flows")
@@ -1682,6 +2343,7 @@ class ScreenshotsPage(QWidget):
             automation_item.setFlags(automation_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.flows_table.setItem(row, 5, automation_item)
         self.refreshing_flow_table = False
+        self._refresh_test_flow_selector()
 
     def refresh_internal_flow_table(self) -> None:
         self.refreshing_internal_flow_table = True
@@ -1731,6 +2393,115 @@ class ScreenshotsPage(QWidget):
             self.locale_table.insertRow(row)
             self.locale_table.setItem(row, 0, QTableWidgetItem(locale.code))
             self.locale_table.setItem(row, 1, QTableWidgetItem(locale.status))
+        self._refresh_test_locale_selector()
+
+    def _refresh_test_flow_selector(self) -> None:
+        if not hasattr(self, "test_flow_selector"):
+            return
+        current_data = self.test_flow_selector.currentData()
+        self.refreshing_test_flow_selector = True
+        self.test_flow_selector.clear()
+        self.test_flow_selector.addItem("Choose screenshot flow", None)
+        for index, flow in enumerate(self.state.screenshot_flows):
+            self.test_flow_selector.addItem(flow.name, index)
+        if isinstance(current_data, int) and 0 <= current_data < len(self.state.screenshot_flows):
+            self.test_flow_selector.setCurrentIndex(current_data + 1)
+        self.refreshing_test_flow_selector = False
+        self._update_selected_flow_label()
+
+    def _refresh_test_locale_selector(self) -> None:
+        if not hasattr(self, "test_locale_selector"):
+            return
+        current_locale = self.test_locale_selector.currentData()
+        self.refreshing_test_locale_selector = True
+        self.test_locale_selector.clear()
+        locales = [locale.code for locale in self.state.selected_locales]
+        if not locales:
+            self.test_locale_selector.addItem("No locale selected", "")
+        for locale in locales:
+            self.test_locale_selector.addItem(locale, locale)
+        if current_locale in locales:
+            index = self.test_locale_selector.findData(current_locale)
+            if index >= 0:
+                self.test_locale_selector.setCurrentIndex(index)
+        self.refreshing_test_locale_selector = False
+
+    def _sync_test_flow_selector_from_table(self) -> None:
+        if self.refreshing_flow_table or not hasattr(self, "test_flow_selector"):
+            return
+        selected_rows = self.flows_table.selectionModel().selectedRows()
+        if not selected_rows:
+            self._update_selected_flow_label()
+            return
+        row = selected_rows[0].row()
+        index = self.test_flow_selector.findData(row)
+        if index >= 0:
+            self.refreshing_test_flow_selector = True
+            self.test_flow_selector.setCurrentIndex(index)
+            self.refreshing_test_flow_selector = False
+        self._update_selected_flow_label()
+
+    def _sync_test_locale_selector_from_table(self) -> None:
+        if self.refreshing_locale_tables or not hasattr(self, "test_locale_selector"):
+            return
+        selected_rows = self.locale_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+        item = self.locale_table.item(selected_rows[0].row(), 0)
+        if not item:
+            return
+        index = self.test_locale_selector.findData(item.text())
+        if index >= 0:
+            self.refreshing_test_locale_selector = True
+            self.test_locale_selector.setCurrentIndex(index)
+            self.refreshing_test_locale_selector = False
+
+    def on_test_flow_selection_changed(self) -> None:
+        if self.refreshing_test_flow_selector:
+            return
+        flow_index = self.test_flow_selector.currentData()
+        if isinstance(flow_index, int) and 0 <= flow_index < self.flows_table.rowCount():
+            self.flows_table.selectRow(flow_index)
+        else:
+            self.flows_table.clearSelection()
+        self._update_selected_flow_label()
+
+    def on_test_locale_selection_changed(self) -> None:
+        if self.refreshing_test_locale_selector:
+            return
+        locale = self.test_locale_selector.currentData()
+        if not locale:
+            return
+        for row in range(self.locale_table.rowCount()):
+            item = self.locale_table.item(row, 0)
+            if item and item.text() == locale:
+                self.locale_table.selectRow(row)
+                return
+
+    def _update_selected_flow_label(self) -> None:
+        if not hasattr(self, "selected_flow_label"):
+            return
+        flow = self._flow_from_test_selector()
+        if not flow:
+            self.selected_flow_label.setText(
+                "No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."
+            )
+            return
+        self.selected_flow_label.setText(f"Selected screenshot flow: {flow.name}")
+
+    def _flow_from_test_selector(self) -> ScreenshotFlow | None:
+        if not hasattr(self, "test_flow_selector"):
+            return None
+        flow_index = self.test_flow_selector.currentData()
+        if isinstance(flow_index, int) and 0 <= flow_index < len(self.state.screenshot_flows):
+            return self.state.screenshot_flows[flow_index]
+        return None
+
+    def _locale_from_test_selector(self) -> str:
+        if not hasattr(self, "test_locale_selector"):
+            return ""
+        locale = self.test_locale_selector.currentData()
+        return str(locale or "")
 
     def on_flow_item_changed(self, item: QTableWidgetItem) -> None:
         if self.refreshing_flow_table:
@@ -1758,6 +2529,7 @@ class ScreenshotsPage(QWidget):
         status_item = self.flows_table.item(row, 4)
         if status_item and status_item.text() != "Edited":
             status_item.setText("Edited")
+        self._refresh_test_flow_selector()
 
     def on_internal_flow_item_changed(self, item: QTableWidgetItem) -> None:
         if self.refreshing_internal_flow_table:
@@ -1781,19 +2553,13 @@ class ScreenshotsPage(QWidget):
             flow.description = item.text().strip()
 
     def on_run_capture(self) -> None:
-        if not self.state.connected_devices:
-            self.log_service.warning("No connected device available for screenshot capture.")
-            self.status_badge.set_status("warning", "No devices")
-            return
-
         if self.capture_backend_selector.currentText() == "Internal ADB Flow Engine":
             self.on_run_all_internal_flows()
             return
 
         locales = [locale.code for locale in self.state.selected_locales]
         if not locales:
-            self.log_service.warning("No target locales selected for screenshots.")
-            self.status_badge.set_status("warning", "No locales")
+            self._show_blocking_reasons(["No locale selected."], "No locales")
             return
 
         scope = self.capture_scope_selector.currentText()
@@ -1834,49 +2600,35 @@ class ScreenshotsPage(QWidget):
         return self._enabled_flows_from_table()
 
     def _start_capture(self, flows: List[ScreenshotFlow], locales: List[str]) -> None:
+        self._sync_adb_path()
         self._save_locale_preparation_settings_to_state()
-        if not flows:
+        backend = self.capture_backend_selector.currentText()
+        blocking_reasons = self._capture_blocking_reasons(flows, locales, backend)
+        if blocking_reasons:
             self.capture_button.setEnabled(True)
-            self.log_service.warning("No screenshot flows available for capture.")
-            self.status_badge.set_status("warning", "No flows")
+            self.capture_selected_button.setEnabled(True)
+            self.capture_widget_button.setEnabled(True)
+            self.capture_current_language_test_button.setEnabled(True)
+            self._show_blocking_reasons(blocking_reasons)
             return
 
-        device = self.state.connected_devices[self.device_selector.currentIndex()]
+        device = self._selected_device()
+        if not device:
+            self._show_blocking_reasons(["No device selected."])
+            return
         output_folder = self.output_folder_input.text().strip()
-        if not output_folder:
-            self.status_badge.set_status("warning", "Folder needed")
-            self.log_service.warning("Select a screenshot output folder before capturing.")
-            return
-        if not self.adb_service.is_output_folder_writable(output_folder):
-            self.status_badge.set_status("warning", "Folder issue")
-            self.log_service.warning("Screenshot output folder is not writable. Choose another folder.")
-            self.on_run_adb_diagnostics()
-            return
         self.capture_button.setEnabled(False)
         self.capture_selected_button.setEnabled(False)
         self.capture_widget_button.setEnabled(False)
+        self.capture_current_language_test_button.setEnabled(False)
         self.status_badge.set_status("info", "Capturing")
         self.progress_panel.reset("Starting screenshot capture")
-        backend = self.capture_backend_selector.currentText()
         if backend == "Internal ADB Flow Engine":
             self.capture_button.setEnabled(True)
             self.capture_selected_button.setEnabled(True)
             self.capture_widget_button.setEnabled(True)
+            self.capture_current_language_test_button.setEnabled(True)
             self.on_run_all_internal_flows()
-            return
-        if backend == "Maestro flow + ADB screencap" and any(not flow.automation_path for flow in flows):
-            self.capture_button.setEnabled(True)
-            self.capture_selected_button.setEnabled(True)
-            self.capture_widget_button.setEnabled(True)
-            self.status_badge.set_status("warning", "Flow missing")
-            self.log_service.warning("Maestro capture requires flows loaded from .yaml or .yml files.")
-            return
-        if self.launch_before_capture_checkbox.isChecked() and not self.state.detected_package_name:
-            self.capture_button.setEnabled(True)
-            self.capture_selected_button.setEnabled(True)
-            self.capture_widget_button.setEnabled(True)
-            self.status_badge.set_status("warning", "Package missing")
-            self.log_service.warning("Scan the Android project before using launch-before-capture.")
             return
         self.log_service.info(f"Starting {backend} for {len(flows)} screenshot flows.")
         for flow in self.state.screenshot_flows:
@@ -1910,6 +2662,7 @@ class ScreenshotsPage(QWidget):
         self.capture_button.setEnabled(True)
         self.capture_selected_button.setEnabled(True)
         self.capture_widget_button.setEnabled(True)
+        self.capture_current_language_test_button.setEnabled(True)
         self.state.screenshot_results = results
         self.state.deployment_status.screenshots_captured = bool(results)
         for flow in self.state.screenshot_flows:
@@ -1927,12 +2680,15 @@ class ScreenshotsPage(QWidget):
         self.discover_button.setEnabled(True)
         self.load_maestro_button.setEnabled(True)
         self.run_diagnostics_button.setEnabled(True)
+        self.test_adb_path_button.setEnabled(True)
         self.test_connection_button.setEnabled(True)
         self.test_screencap_button.setEnabled(True)
         self.capture_button.setEnabled(True)
         self.capture_selected_button.setEnabled(True)
+        self.capture_current_language_test_button.setEnabled(True)
         self.detect_android_button.setEnabled(True)
         self.test_locale_prep_button.setEnabled(True)
+        self.test_all_locale_prep_button.setEnabled(True)
         self.run_prep_only_button.setEnabled(True)
         self.capture_widget_button.setEnabled(True)
         self.open_locale_settings_button.setEnabled(True)
@@ -1940,6 +2696,10 @@ class ScreenshotsPage(QWidget):
         self._set_internal_buttons_enabled(True)
         self.status_badge.set_status("error", "Failed")
         self.progress_panel.set_status("Screenshot operation failed", 0)
+        for locale in self.pending_locale_test_locales:
+            self.state.locale_preparation_test_results[locale] = "Failed"
+        self.pending_locale_test_locales = []
+        self._update_locale_readiness()
         self.log_service.error(f"Screenshot worker error: {message}")
         self._update_diagnostics_from_service()
 
@@ -1960,6 +2720,13 @@ class ScreenshotsPage(QWidget):
             if 0 <= row < len(self.state.screenshot_flows):
                 flows.append(self.state.screenshot_flows[row])
         return flows
+
+    def _selected_flows_for_capture(self) -> List[ScreenshotFlow]:
+        flows = self._selected_flows_from_table()
+        if flows:
+            return flows
+        flow = self._flow_from_test_selector()
+        return [flow] if flow else []
 
     def _enabled_internal_flows_from_table(self) -> List[InternalFlow]:
         enabled_flows: List[InternalFlow] = []
@@ -2028,6 +2795,9 @@ class ScreenshotsPage(QWidget):
     def _sync_adb_path(self) -> None:
         self.state.manual_adb_path = self.adb_path_input.text().strip()
         self.adb_service.set_manual_adb_path(self.state.manual_adb_path)
+        self.state.screenshot_output_folder = self.output_folder_input.text().strip()
+        if self.state.screenshot_output_folder:
+            self.settings_service.save_screenshot_output_folder(self.state.screenshot_output_folder)
 
     def _set_internal_buttons_enabled(self, enabled: bool) -> None:
         self.internal_flow_table.setEnabled(enabled)
@@ -2050,21 +2820,21 @@ class ScreenshotsPage(QWidget):
             button.setEnabled(enabled)
 
     def _internal_run_context(self) -> tuple[DeviceInfo, str, List[str]] | None:
+        self._sync_adb_path()
         device = self._selected_device()
         if not device:
-            self.status_badge.set_status("warning", "No devices")
-            self.log_service.warning("No connected device available for internal ADB flow.")
+            self._show_blocking_reasons(["No device selected."], "No devices")
             return None
 
         output_folder = self.output_folder_input.text().strip()
         if not output_folder:
-            self.status_badge.set_status("warning", "Folder needed")
-            self.log_service.warning("Select a screenshot output folder before running an internal ADB flow.")
+            self._show_blocking_reasons(["Output folder not writable."], "Folder needed")
             return None
         if not self.adb_service.is_output_folder_writable(output_folder):
-            self.status_badge.set_status("warning", "Folder issue")
-            self.log_service.warning("Screenshot output folder is not writable. Choose another folder.")
-            self.on_run_adb_diagnostics()
+            self._show_blocking_reasons(["Output folder not writable."], "Folder issue")
+            return None
+        if not self.adb_service.resolve_adb_path(self.state.manual_adb_path).found:
+            self._show_blocking_reasons(["ADB path invalid."], "ADB path invalid")
             return None
 
         locales = self._selected_locales_from_table()
@@ -2073,7 +2843,6 @@ class ScreenshotsPage(QWidget):
         if not locales:
             locales = ["manual"]
 
-        self._sync_adb_path()
         self.capture_backend_selector.setCurrentText("Internal ADB Flow Engine")
         return device, output_folder, locales
 
@@ -2250,6 +3019,19 @@ class ScreenshotsPage(QWidget):
         text = diagnostics.as_text()
         self.state.last_adb_diagnostics_text = text
         self.diagnostics_view.setPlainText(text)
+        if diagnostics.adb_found and diagnostics.adb_path:
+            self.adb_resolved_label.setText(f"Resolved adb path: {diagnostics.adb_path}")
+            self.adb_source_label.setText(f"ADB path source: {diagnostics.adb_source}")
+            if diagnostics.adb_source != "PATH":
+                self.adb_path_note_label.setText(
+                    "adb is not in PATH, but PlayPulse found it by full path and will use that resolved path."
+                )
+            else:
+                self.adb_path_note_label.setText("")
+        else:
+            self.adb_resolved_label.setText("Resolved adb path: Not detected")
+            self.adb_source_label.setText("ADB path source: N/A")
+            self.adb_path_note_label.setText(diagnostics.user_message or "")
 
     def _update_diagnostics_from_service(self) -> None:
         diagnostics = self.adb_service.last_diagnostics

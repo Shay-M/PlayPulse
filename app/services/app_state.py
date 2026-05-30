@@ -25,7 +25,11 @@ class AppState:
         self.internal_flows: List[InternalFlow] = []
         self.internal_flows_folder: str = ""
         self.screenshot_results: Dict[str, str] = {}
+        self.screenshot_output_folder: str = ""
         self.manual_adb_path: str = ""
+        self.last_selected_device_serial: str = ""
+        self.locale_preparation_settings_path: str = ""
+        self.locale_preparation_test_results: Dict[str, str] = {}
         self.last_adb_diagnostics_text: str = ""
         self.deployment_status: DeploymentStatus = DeploymentStatus()
 

@@ -179,20 +179,34 @@ class ScreenshotService:
         output_folder: str = "",
         progress_callback: Callable[[object], None] | None = None,
     ) -> None:
-        if not locale_preparation_settings or locale_preparation_settings.locale_preparation_mode == "none":
+        if not locale_preparation_settings:
             return
 
         mode = locale_preparation_settings.locale_preparation_mode
         options = locale_preparation_settings.common_options
         flow_output_folder = output_folder or str(Path.cwd())
 
+        if mode == "none":
+            if locale_preparation_settings.capture_target_type == "widget_home_screen" and options.go_home_before_widget_capture:
+                if progress_callback:
+                    progress_callback({"message": "Going home before widget capture"})
+                self.adb_service.go_home(device.identifier, manual_adb_path)
+                if options.wait_for_widget_render_seconds > 0:
+                    self.adb_service.wait(options.wait_for_widget_render_seconds)
+            return
+
         if mode in {"device_language_command_assisted", "device_language_recorded_flow", "combined"}:
-            if progress_callback:
-                progress_callback({"message": f"Opening Android locale settings for {locale}"})
-            self.adb_service.open_locale_settings(device.identifier, manual_adb_path)
             flow_name = locale_preparation_settings.device_language_flows.get(locale, "")
             if mode == "device_language_recorded_flow" and not flow_name:
-                raise RuntimeError(f"No device language flow is assigned for {locale}.")
+                raise RuntimeError(f"{locale} has no assigned device language flow.")
+            should_open_locale_settings = (
+                mode == "device_language_command_assisted"
+                or bool(flow_name and options.open_locale_settings_before_device_flow)
+            )
+            if should_open_locale_settings:
+                if progress_callback:
+                    progress_callback({"message": f"Opening Android locale settings for {locale}"})
+                self.adb_service.open_locale_settings(device.identifier, manual_adb_path)
             if flow_name:
                 self._run_named_internal_flow(
                     device,
@@ -251,6 +265,11 @@ class ScreenshotService:
                     manual_adb_path,
                     progress_callback,
                 )
+
+        if (options.force_stop_after_locale_change or options.relaunch_after_locale_change) and not package_name.strip():
+            raise RuntimeError(
+                "Package name is required for force stop/relaunch. Scan the Android project first or disable these options."
+            )
 
         if options.force_stop_after_locale_change:
             if progress_callback:

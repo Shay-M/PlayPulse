@@ -39,6 +39,7 @@ class CommonLocalePreparationOptions:
     force_stop_after_locale_change: bool = True
     relaunch_after_locale_change: bool = True
     wait_after_locale_change_seconds: int = 2
+    open_locale_settings_before_device_flow: bool = False
     go_home_before_widget_capture: bool = True
     wait_for_widget_render_seconds: int = 3
 
@@ -47,6 +48,7 @@ class CommonLocalePreparationOptions:
             "force_stop_after_locale_change": self.force_stop_after_locale_change,
             "relaunch_after_locale_change": self.relaunch_after_locale_change,
             "wait_after_locale_change_seconds": self.wait_after_locale_change_seconds,
+            "open_locale_settings_before_device_flow": self.open_locale_settings_before_device_flow,
             "go_home_before_widget_capture": self.go_home_before_widget_capture,
             "wait_for_widget_render_seconds": self.wait_for_widget_render_seconds,
         }
@@ -57,6 +59,9 @@ class CommonLocalePreparationOptions:
             force_stop_after_locale_change=bool(data.get("force_stop_after_locale_change", True)),
             relaunch_after_locale_change=bool(data.get("relaunch_after_locale_change", True)),
             wait_after_locale_change_seconds=int(data.get("wait_after_locale_change_seconds", 2)),
+            open_locale_settings_before_device_flow=bool(
+                data.get("open_locale_settings_before_device_flow", False)
+            ),
             go_home_before_widget_capture=bool(data.get("go_home_before_widget_capture", True)),
             wait_for_widget_render_seconds=int(data.get("wait_for_widget_render_seconds", 3)),
         )

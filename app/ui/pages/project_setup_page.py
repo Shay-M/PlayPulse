@@ -21,6 +21,7 @@ from app.models.locale_info import LocaleInfo
 from app.services.app_state import AppState
 from app.services.log_service import LogService
 from app.services.project_scanner import ProjectScanner
+from app.services.settings_service import SettingsService
 from app.ui.components.status_badge import StatusBadge
 from app.ui.workers import Worker
 
@@ -31,12 +32,14 @@ class ProjectSetupPage(QWidget):
         state: AppState,
         log_service: LogService,
         project_scanner: ProjectScanner,
+        settings_service: SettingsService,
         worker_pool,
     ) -> None:
         super().__init__()
         self.state = state
         self.log_service = log_service
         self.project_scanner = project_scanner
+        self.settings_service = settings_service
         self.worker_pool = worker_pool
         self._init_ui()
 
@@ -212,6 +215,7 @@ class ProjectSetupPage(QWidget):
     def on_scan_finished(self, result: dict) -> None:
         self.scan_button.setEnabled(True)
         self.state.selected_project_path = self.project_path_input.text().strip()
+        self.settings_service.save_last_project_path(self.state.selected_project_path)
         self.state.detected_package_name = str(result.get("package_name", ""))
         self.state.detected_project_type = str(result.get("project_type", ""))
         self.state.detected_gradle_files = list(result.get("gradle_files", []))
