@@ -38,8 +38,16 @@ from app.services.locale_preparation_service import LocalePreparationService
 from app.services.log_service import LogService
 from app.services.screenshot_service import ScreenshotService
 from app.services.settings_service import SettingsService
+from app.services.ui_test_setup_analyzer import UITestSetupAnalyzer
+from app.services.gradle_modifier import GradleModifier
+from app.services.ui_test_template_generator import UITestTemplateGenerator
+from app.services.screenshot_collector import ScreenshotCollector
+from app.services.gradle_runner import GradleRunner
+from app.models.screenshot_strategy import ScreenshotStrategy
+from app.models.ui_test_setup_status import UITestSetupStatus
 from app.ui.components.progress_panel import ProgressPanel
 from app.ui.components.status_badge import StatusBadge
+from app.ui.components.ui_test_strategy_panel import UITestStrategyPanel
 from app.ui.workers import Worker
 
 
@@ -80,6 +88,8 @@ class ScreenshotsPage(QWidget):
         self.preview_labels: list[QLabel] = []
         self.pending_locale_test_locales: list[str] = []
         self.raw_command_preview_visible = False
+        self.last_ui_test_analysis_status = None
+        self.generated_ui_test_files: dict[str, str] = {}
         self.refreshing_flow_table = False
         self.refreshing_internal_flow_table = False
         self.refreshing_internal_step_table = False
@@ -112,6 +122,25 @@ class ScreenshotsPage(QWidget):
         subtitle.setObjectName("pageSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
+        # Strategy selector (recommended: UI Test / Screenshot Test)
+        self.strategy_selector = QComboBox()
+        self.strategy_selector.addItem("Recommended: UI Test / Screenshot Test", "ui_test")
+        self.strategy_selector.addItem("Manual ADB Capture", "manual_adb")
+        self.strategy_selector.addItem("Internal ADB Flow Engine", "internal_adb_flow")
+        self.strategy_selector.addItem("Widget / Device Language Capture", "widget_language")
+        self.strategy_selector.addItem("Optional Maestro", "maestro")
+        # Initialize from state
+        try:
+            current = getattr(self.state, "strategy_mode", ScreenshotStrategy.default())
+            # ensure string value
+            value = current.value if isinstance(current, ScreenshotStrategy) else str(current)
+            index = next(i for i in range(self.strategy_selector.count()) if self.strategy_selector.itemData(i) == value)
+            self.strategy_selector.setCurrentIndex(index)
+        except Exception:
+            # default to first
+            self.strategy_selector.setCurrentIndex(0)
+        self.strategy_selector.currentIndexChanged.connect(self.on_strategy_changed)
+        title_box.addWidget(self.strategy_selector)
         self.status_badge = StatusBadge("Idle", "muted")
         header_layout.addLayout(title_box, 1)
         header_layout.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignTop)
@@ -280,7 +309,31 @@ class ScreenshotsPage(QWidget):
         self.steps_tabs.addTab(device_page, "Device & ADB")
 
         capture_target_page = QWidget()
+        self.steps_tabs.addTab(capture_target_page, "Capture Target")
         capture_target_layout = QVBoxLayout(capture_target_page)
+        # UI Test Setup tab (hidden unless UI Test strategy selected)
+        ui_test_setup_page = QWidget()
+        ui_test_setup_layout = QVBoxLayout(ui_test_setup_page)
+        ui_test_setup_layout.setContentsMargins(0, 0, 0, 0)
+        ui_test_setup_layout.setSpacing(16)
+        self.ui_test_strategy_panel = UITestStrategyPanel(
+            state=self.state,
+            log_service=self.log_service,
+            adb_service=self.adb_service,
+            settings_service=self.settings_service,
+            worker_pool=self.worker_pool,
+            status_callback=self.status_badge.set_status,
+            selected_device_supplier=self._selected_device_serial,
+        )
+        ui_test_setup_layout.addWidget(self.ui_test_strategy_panel)
+        ui_test_setup_layout.addStretch()
+        self.ui_test_setup_index = self.steps_tabs.addTab(ui_test_setup_page, "UI Test Setup")
+        # show only if strategy is UI Test
+        try:
+            is_ui = getattr(self.state, "strategy_mode", None) == ScreenshotStrategy.UI_TEST
+            self.steps_tabs.setTabVisible(self.ui_test_setup_index, is_ui)
+        except Exception:
+            pass
         capture_target_layout.setContentsMargins(0, 0, 0, 0)
         capture_target_layout.setSpacing(16)
         capture_target_layout.addWidget(self._build_capture_target_card())
@@ -839,6 +892,186 @@ class ScreenshotsPage(QWidget):
         self._populate_locale_mapping_tables()
         return card
 
+    def _build_ui_test_setup_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QGridLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(10)
+
+        title = QLabel("UI Test / Screenshot Test - Project Analysis")
+        title.setObjectName("cardTitle")
+        layout.addWidget(title, 0, 0, 1, 3)
+
+        self.analyze_project_button = QPushButton("Analyze Android project")
+        self.analyze_project_button.setObjectName("secondaryButton")
+        self.analyze_project_button.clicked.connect(self.on_analyze_project_clicked)
+        layout.addWidget(self.analyze_project_button, 1, 0)
+
+        self.ui_test_details_label = QLabel("Detected project details will appear here.")
+        self.ui_test_details_label.setObjectName("mutedText")
+        self.ui_test_details_label.setWordWrap(True)
+        layout.addWidget(self.ui_test_details_label, 2, 0, 1, 3)
+
+        # Details grid
+        self.detail_app_module = QLabel("App module: N/A")
+        self.detail_namespace = QLabel("Namespace: N/A")
+        self.detail_application_id = QLabel("ApplicationId: N/A")
+        self.detail_package_path = QLabel("Test package path: N/A")
+        self.detail_gradle_type = QLabel("Gradle DSL: N/A")
+        self.detail_test_runner = QLabel("Test runner: N/A")
+
+        layout.addWidget(self.detail_app_module, 3, 0)
+        layout.addWidget(self.detail_namespace, 3, 1)
+        layout.addWidget(self.detail_application_id, 3, 2)
+        layout.addWidget(self.detail_package_path, 4, 0)
+        layout.addWidget(self.detail_gradle_type, 4, 1)
+        layout.addWidget(self.detail_test_runner, 4, 2)
+
+        # Dependencies table
+        deps_title = QLabel("Detected androidTest dependencies")
+        deps_title.setObjectName("cardTitle")
+        layout.addWidget(deps_title, 5, 0, 1, 3)
+        self.deps_table = QTableWidget(0, 2)
+        self.deps_table.setHorizontalHeaderLabels(["Dependency", "Status"])
+        self.deps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.deps_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.deps_table.setMinimumHeight(180)
+        layout.addWidget(self.deps_table, 6, 0, 1, 3)
+
+        preview_title = QLabel("Gradle setup preview")
+        preview_title.setObjectName("cardTitle")
+        layout.addWidget(preview_title, 7, 0, 1, 3)
+        self.gradle_preview = QPlainTextEdit()
+        self.gradle_preview.setReadOnly(True)
+        self.gradle_preview.setPlaceholderText("Gradle setup preview will appear after analysis.")
+        self.gradle_preview.setMinimumHeight(160)
+        layout.addWidget(self.gradle_preview, 8, 0, 1, 3)
+ 
+        warnings_title = QLabel("Warnings & Messages")
+        warnings_title.setObjectName("cardTitle")
+        layout.addWidget(warnings_title, 9, 0, 1, 3)
+        self.ui_test_warnings = QPlainTextEdit()
+        self.ui_test_warnings.setReadOnly(True)
+        self.ui_test_warnings.setMinimumHeight(120)
+        layout.addWidget(self.ui_test_warnings, 10, 0, 1, 3)
+
+        template_title = QLabel("Generated UI test templates")
+        template_title.setObjectName("cardTitle")
+        layout.addWidget(template_title, 11, 0, 1, 3)
+
+        self.generate_ui_test_preview_button = QPushButton("Preview generated UI test files")
+        self.generate_ui_test_preview_button.setObjectName("secondaryButton")
+        self.generate_ui_test_preview_button.clicked.connect(self.on_generate_ui_test_templates_clicked)
+
+        self.apply_ui_test_templates_button = QPushButton("Create UI test files")
+        self.apply_ui_test_templates_button.setObjectName("secondaryButton")
+        self.apply_ui_test_templates_button.clicked.connect(self.on_apply_ui_test_templates_clicked)
+        self.apply_ui_test_templates_button.setEnabled(False)
+
+        action_buttons = QHBoxLayout()
+        action_buttons.setSpacing(8)
+        action_buttons.addWidget(self.generate_ui_test_preview_button)
+        action_buttons.addWidget(self.apply_ui_test_templates_button)
+        # Add run and collect buttons (enabled after templates applied)
+        self.run_connected_tests_button = QPushButton("Run connectedAndroidTest")
+        self.run_connected_tests_button.setObjectName("secondaryButton")
+        self.run_connected_tests_button.clicked.connect(self.on_run_connected_tests_clicked)
+        self.run_connected_tests_button.setEnabled(False)
+        action_buttons.addWidget(self.run_connected_tests_button)
+
+        self.collect_screenshots_button = QPushButton("Collect screenshots")
+        self.collect_screenshots_button.setObjectName("secondaryButton")
+        self.collect_screenshots_button.clicked.connect(self.on_collect_screenshots_clicked)
+        self.collect_screenshots_button.setEnabled(False)
+        action_buttons.addWidget(self.collect_screenshots_button)
+
+        layout.addLayout(action_buttons, 12, 0, 1, 3)
+
+        self.ui_test_template_preview = QPlainTextEdit()
+        self.ui_test_template_preview.setReadOnly(True)
+        self.ui_test_template_preview.setPlaceholderText("Generated UI test file preview will appear here.")
+        self.ui_test_template_preview.setMinimumHeight(160)
+        layout.addWidget(self.ui_test_template_preview, 13, 0, 1, 3)
+
+        return card
+
+    def on_analyze_project_clicked(self) -> None:
+        project_path = self.state.selected_project_path
+        if not project_path:
+            project_path = QFileDialog.getExistingDirectory(self, "Select Android project folder")
+            if not project_path:
+                self.status_badge.set_status("warning", "No project")
+                return
+            self.state.selected_project_path = project_path
+            self.settings_service.save_last_project_path(project_path)
+
+        self.analyze_project_button.setEnabled(False)
+        self.status_badge.set_status("info", "Analyzing")
+        worker = Worker(self._run_ui_test_analysis, project_path)
+        worker.signals.finished.connect(self.on_ui_test_analysis_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def _run_ui_test_analysis(self, project_path: str) -> tuple[UITestSetupStatus, object]:
+        analyzer = UITestSetupAnalyzer(project_path)
+        status = analyzer.analyze()
+        gradle_preview = GradleModifier(project_path).generate_requirements()
+        return status, gradle_preview
+
+    def on_ui_test_analysis_finished(self, result: tuple[UITestSetupStatus, object]) -> None:
+        self.analyze_project_button.setEnabled(True)
+        status, gradle_preview = result
+        self.last_ui_test_analysis_status = status
+        if not status:
+            self.status_badge.set_status("error", "Analysis failed")
+            return
+
+        # Update UI details
+        self.ui_test_details_label.setText(status.messages[0] if status.messages else "Analysis complete.")
+        self.detail_app_module.setText(f"App module: {status.app_module_path or 'N/A'}")
+        self.detail_namespace.setText(f"Namespace: {status.namespace or status.package_name or 'N/A'}")
+        self.detail_application_id.setText(f"ApplicationId: {status.application_id or 'N/A'}")
+        test_pkg = status.namespace or status.package_name or status.application_id or ""
+        test_pkg_path = test_pkg.replace('.', '/') if test_pkg else 'N/A'
+        self.detail_package_path.setText(f"Test package path: {test_pkg_path}")
+        self.detail_gradle_type.setText(f"Gradle DSL: {status.gradle_dsl or 'N/A'}")
+        self.detail_test_runner.setText(f"Test runner: {status.test_instrumentation_runner or 'N/A'}")
+
+        # Fill deps table
+        self.deps_table.setRowCount(0)
+        found = set(status.android_test_dependencies or [])
+        expected = UITestSetupAnalyzer.COMMON_ANDROID_TEST_DEPS + (UITestSetupAnalyzer.COMPOSE_DEPS if status.compose_used else [])
+        for dep in expected:
+            row = self.deps_table.rowCount()
+            self.deps_table.insertRow(row)
+            self.deps_table.setItem(row, 0, QTableWidgetItem(dep))
+            present = any(dep in f for f in found)
+            self.deps_table.setItem(row, 1, QTableWidgetItem("Present" if present else "Missing"))
+
+        # Fill gradle preview
+        if hasattr(self, "gradle_preview") and gradle_preview:
+            preview_lines = [str(line) for line in getattr(gradle_preview, "gradle_changes", [])]
+            preview_text = "\n\n".join(preview_lines).strip()
+            if getattr(gradle_preview, "warnings", None):
+                preview_text += "\n\nWarnings:\n" + "\n".join(gradle_preview.warnings)
+            self.gradle_preview.setPlainText(preview_text.strip())
+
+        # Warnings
+        warnings_text = "\n".join(status.messages or [])
+        if status.missing_dependencies:
+            warnings_text += "\nMissing dependencies: " + ", ".join(status.missing_dependencies)
+        if status.existing_playpulse_test_files:
+            warnings_text += "\nFound PlayPulse test files: " + ", ".join(status.existing_playpulse_test_files)
+        self.ui_test_warnings.setPlainText(warnings_text.strip())
+
+        # Update badge
+        if status.ready_for_ui_test_screenshots:
+            self.status_badge.set_status("success", "Ready")
+        else:
+            self.status_badge.set_status("warning", "Not ready")
+
     def _capture_target_value(self) -> str:
         if self.capture_target_selector.currentText() == "Widget / Home screen":
             return "widget_home_screen"
@@ -1231,6 +1464,195 @@ class ScreenshotsPage(QWidget):
         self._update_diagnostics_from_service()
         self.status_badge.set_status("success", "Android info detected")
         self.log_service.success("Android device information detected.")
+
+    def on_strategy_changed(self, index: int) -> None:
+        try:
+            value = self.strategy_selector.itemData(index)
+            # Update app state
+            try:
+                self.state.strategy_mode = ScreenshotStrategy(value)
+            except Exception:
+                # fallback to default
+                self.state.strategy_mode = ScreenshotStrategy.default()
+            # Persist selection
+            try:
+                    self.settings_service.save_screenshot_strategy(str(self.state.strategy_mode.value))
+            except Exception:
+                pass
+            self._update_ui_test_tab_visibility()
+            self.log_service.info(f"Screenshot strategy set to {self.state.strategy_mode}")
+        except Exception:
+            return
+
+    def _update_ui_test_tab_visibility(self) -> None:
+        try:
+            visible = self.state.strategy_mode == ScreenshotStrategy.UI_TEST
+            self.steps_tabs.setTabVisible(self.ui_test_setup_index, visible)
+        except Exception:
+            pass
+
+    def on_generate_ui_test_templates_clicked(self) -> None:
+        project_path = self.state.selected_project_path
+        if not project_path:
+            project_path = QFileDialog.getExistingDirectory(self, "Select Android project folder")
+            if not project_path:
+                self.status_badge.set_status("warning", "No project")
+                return
+            self.state.selected_project_path = project_path
+            self.settings_service.save_last_project_path(project_path)
+
+        package_name = ""
+        if self.last_ui_test_analysis_status:
+            package_name = (
+                self.last_ui_test_analysis_status.namespace
+                or self.last_ui_test_analysis_status.package_name
+                or self.last_ui_test_analysis_status.application_id
+            )
+        if not package_name:
+            package_name = self.state.detected_package_name
+        if not package_name:
+            self.status_badge.set_status("warning", "Package name missing")
+            self.ui_test_template_preview.setPlainText(
+                "Cannot generate UI test templates without a package name. Analyze the project first."
+            )
+            return
+
+        self.generate_ui_test_preview_button.setEnabled(False)
+        self.apply_ui_test_templates_button.setEnabled(False)
+        self.status_badge.set_status("info", "Generating templates")
+        worker = Worker(self._generate_ui_test_templates, project_path, package_name)
+        worker.signals.finished.connect(self.on_ui_test_template_preview_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def _generate_ui_test_templates(self, project_path: str, package_name: str) -> dict[str, str]:
+        generator = UITestTemplateGenerator(project_path, package_name)
+        return generator.generate_templates()
+
+    def on_ui_test_template_preview_finished(self, result: dict[str, str]) -> None:
+        self.generate_ui_test_preview_button.setEnabled(True)
+        self.generated_ui_test_files = result or {}
+        if not result:
+            self.ui_test_template_preview.setPlainText("No UI test templates could be generated.")
+            self.status_badge.set_status("warning", "No template preview")
+            return
+
+        preview_lines: list[str] = []
+        for path, content in result.items():
+            preview_lines.append(f"--- {path} ---\n{content.strip()}")
+        self.ui_test_template_preview.setPlainText("\n\n".join(preview_lines))
+        self.apply_ui_test_templates_button.setEnabled(True)
+        self.status_badge.set_status("success", "Template preview ready")
+
+    def on_apply_ui_test_templates_clicked(self) -> None:
+        if not self.generated_ui_test_files:
+            self.status_badge.set_status("warning", "No templates to save")
+            return
+
+        self.apply_ui_test_templates_button.setEnabled(False)
+        self.status_badge.set_status("info", "Writing UI test files")
+        worker = Worker(self._apply_ui_test_templates, self.state.selected_project_path, self.generated_ui_test_files)
+        worker.signals.finished.connect(self.on_ui_test_template_apply_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def _apply_ui_test_templates(self, project_path: str, files_map: dict[str, str]) -> dict[str, list[str]]:
+        generator = UITestTemplateGenerator(project_path, "com.example.playpulse")
+        return generator.write_templates(files_map)
+
+    def on_ui_test_template_apply_finished(self, result: dict[str, list[str]]) -> None:
+        written = result.get("written", [])
+        skipped = result.get("skipped", [])
+        errors = result.get("errors", [])
+        messages: list[str] = []
+        if written:
+            messages.append(f"Saved {len(written)} files.")
+        if skipped:
+            messages.append(f"Skipped existing files: {', '.join(skipped)}")
+        if errors:
+            messages.append(f"Errors: {', '.join(errors)}")
+
+        self.status_badge.set_status("success" if written and not errors else "warning")
+        ok_to_proceed = bool(written and not errors)
+        self.apply_ui_test_templates_button.setEnabled(ok_to_proceed)
+        # Enable running connectedAndroidTest only after templates were written successfully
+        try:
+            self.run_connected_tests_button.setEnabled(ok_to_proceed)
+        except Exception:
+            pass
+        self.ui_test_warnings.setPlainText("\n".join(messages).strip())
+        self.log_service.info("UI test template apply completed")
+
+    def on_run_connected_tests_clicked(self) -> None:
+        project_path = self.state.selected_project_path
+        if not project_path:
+            project_path = QFileDialog.getExistingDirectory(self, "Select Android project folder")
+            if not project_path:
+                self.status_badge.set_status("warning", "No project")
+                return
+            self.state.selected_project_path = project_path
+            self.settings_service.save_last_project_path(project_path)
+
+        self.run_connected_tests_button.setEnabled(False)
+        self.status_badge.set_status("info", "Running tests")
+        worker = Worker(self._run_connected_android_test, project_path)
+        worker.signals.finished.connect(self.on_connected_tests_finished)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def _run_connected_android_test(self, project_path: str) -> dict:
+        runner = GradleRunner(project_path)
+        return runner.run_connected_android_test()
+
+    def on_connected_tests_finished(self, result: dict) -> None:
+        try:
+            self.run_connected_tests_button.setEnabled(True)
+        except Exception:
+            pass
+        exit_code = str(result.get("exit_code", "-1"))
+        out = result.get("stdout", "")
+        err = result.get("stderr", "")
+        self.ui_test_warnings.setPlainText(f"Gradle exit: {exit_code}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}")
+        # If tests succeeded, enable screenshot collection
+        if exit_code == "0":
+            try:
+                self.collect_screenshots_button.setEnabled(True)
+            except Exception:
+                pass
+
+    def on_collect_screenshots_clicked(self) -> None:
+        pkg = ""
+        if self.last_ui_test_analysis_status:
+            pkg = (
+                self.last_ui_test_analysis_status.namespace
+                or self.last_ui_test_analysis_status.package_name
+                or self.last_ui_test_analysis_status.application_id
+            )
+        if not pkg:
+            pkg = self.state.detected_package_name
+        if not pkg:
+            self.status_badge.set_status("warning", "Package name missing")
+            return
+
+        self.collect_screenshots_button.setEnabled(False)
+        self.status_badge.set_status("info", "Collecting screenshots")
+        worker = Worker(self._collect_screenshots, pkg, str(Path.cwd() / "playpulse_output" / "screenshots" / pkg), self.state.manual_adb_path)
+        worker.signals.finished.connect(self.on_screenshots_collected)
+        worker.signals.error.connect(self.on_worker_error)
+        self.worker_pool.start(worker)
+
+    def _collect_screenshots(self, package_name: str, local_output: str, manual_adb_path: str) -> dict:
+        collector = ScreenshotCollector(self.adb_service)
+        return collector.collect(package_name, local_output, manual_adb_path)
+
+    def on_screenshots_collected(self, result: dict) -> None:
+        self.collect_screenshots_button.setEnabled(True)
+        if result.get("error"):
+            self.ui_test_warnings.setPlainText(f"Collect error: {result.get('error')}")
+            self.status_badge.set_status("warning", "Collect failed")
+        else:
+            self.ui_test_warnings.setPlainText(f"Pulled screenshots to: {result.get('pulled_to')}")
+            self.status_badge.set_status("success", "Screenshots collected")
 
     def on_open_android_locale_settings(self) -> None:
         device = self._selected_device()

@@ -7,6 +7,7 @@ from app.models.device_info import DeviceInfo
 from app.models.internal_flow import InternalFlow
 from app.models.screenshot_flow import ScreenshotFlow
 from app.models.deployment_status import DeploymentStatus
+from app.models.screenshot_strategy import ScreenshotStrategy
 
 
 class AppState:
@@ -32,6 +33,8 @@ class AppState:
         self.locale_preparation_test_results: Dict[str, str] = {}
         self.last_adb_diagnostics_text: str = ""
         self.deployment_status: DeploymentStatus = DeploymentStatus()
+        # New: preferred screenshot strategy (persisted in settings)
+        self.strategy_mode: ScreenshotStrategy = ScreenshotStrategy.default()
 
     def set_detected_locales(self, locales: List[LocaleInfo]) -> None:
         self.detected_locales = locales
