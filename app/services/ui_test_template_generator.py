@@ -153,9 +153,16 @@ public class PlayPulseScreenshotTest {
 
 object PlayPulseTestConfig {
     const val PACKAGE_NAME = "{package}"
+    // Primary output root on device
     const val OUTPUT_ROOT = "/sdcard/Download/PlayPulseScreenshots"
+
+    // Default locales to iterate when capturing screenshots. Edit as needed.
     val DEFAULT_LOCALES = arrayOf("en-US")
+
+    // Default screenshot names to capture per locale.
     val DEFAULT_SCREENSHOT_NAMES = arrayOf("home", "details")
+
+    // Wait time after sending locale change (ms)
     const val WAIT_AFTER_LOCALE_CHANGE_MS = 1500L
 }
 """
@@ -166,26 +173,55 @@ object PlayPulseTestConfig {
 
 import android.app.Instrumentation
 import android.graphics.Bitmap
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 
 object PlayPulseScreenshotHelper {
-    fun takeScreenshot(instrumentation: Instrumentation, packageName: String, locale: String, screenshotName: String): String? {
-        return try {
-            val outputRoot = PlayPulseTestConfig.OUTPUT_ROOT + "/" + packageName + "/" + locale
-            val dir = File(outputRoot)
-            if (!dir.exists()) dir.mkdirs()
-            val file = File(dir, "${'$'}{screenshotName}.png")
-            val uiAutomation = instrumentation.uiAutomation
-            val bitmap: Bitmap? = uiAutomation.takeScreenshot()
-            if (bitmap == null) return null
-            FileOutputStream(file).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+    private const val TAG = "PlayPulseScreenshotHelper"
+
+    /**
+     * Capture a screenshot and save it to device storage.
+     * Tries primary external path first, then falls back to app external files dir.
+     * Throws AssertionError on failure.
+     */
+    fun takeScreenshot(instrumentation: Instrumentation, packageName: String, locale: String, screenshotName: String): String {
+        val primary = PlayPulseTestConfig.OUTPUT_ROOT + "/" + packageName + "/" + locale
+        val fallbackBase = instrumentation.targetContext.getExternalFilesDir(null)
+        val fallback = fallbackBase?.let { File(it, "PlayPulseScreenshots/$locale").absolutePath }
+
+        val candidates = listOfNotNull(primary, fallback)
+        var lastError: Exception? = null
+
+        for (candidate in candidates) {
+            try {
+                val dir = File(candidate)
+                if (!dir.exists()) dir.mkdirs()
+                val file = File(dir, "$screenshotName.png")
+
+                val uiAutomation = instrumentation.uiAutomation
+                val bitmap: Bitmap? = uiAutomation.takeScreenshot()
+                if (bitmap == null) throw AssertionError("Failed to capture screenshot bitmap")
+
+                FileOutputStream(file).use { out ->
+                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                        throw AssertionError("Failed to compress and write PNG file")
+                    }
+                }
+
+                if (!file.exists() || file.length() == 0L) {
+                    throw AssertionError("Screenshot file was not saved correctly: ${'$'}{file.absolutePath}")
+                }
+
+                Log.i(TAG, "Screenshot saved: ${'$'}{file.absolutePath} (size=${'$'}{file.length()} bytes)")
+                return file.absolutePath
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to save screenshot to candidate path $candidate: ${'$'}{e.message}")
+                lastError = e
             }
-            file.absolutePath
-        } catch (e: Exception) {
-            null
         }
+
+        throw AssertionError("Failed to save screenshot for '$screenshotName' in locales $locale: ${'$'}{lastError?.message}")
     }
 }
 """
@@ -196,24 +232,29 @@ object PlayPulseScreenshotHelper {
 
 import android.app.Instrumentation
 import android.content.Intent
-import android.os.Bundle
+import android.util.Log
 
 object PlayPulseLocaleHelper {
-    fun setAppLocale(instrumentation: Instrumentation, packageName: String, localeTag: String) {
-        try {
-            // Default: send a broadcast intent your app can handle to change locale
-            val intent = Intent("com.playpulse.SET_LOCALE")
+    private const val TAG = "PlayPulseLocaleHelper"
+
+    /**
+     * Default locale switching requires the app to implement a broadcast receiver or deep link.
+     * If the app does not implement it, screenshots will be captured in the current app language.
+     */
+    fun setAppLocale(instrumentation: Instrumentation, packageName: String, localeTag: String): Boolean {
+        val action = "${package_name}.PLAYPULSE_SET_LOCALE"
+        return try {
+            val intent = Intent(action)
             intent.setPackage(packageName)
             intent.putExtra("locale", localeTag)
             instrumentation.targetContext.sendBroadcast(intent)
             Thread.sleep(PlayPulseTestConfig.WAIT_AFTER_LOCALE_CHANGE_MS)
+            Log.i(TAG, "Locale command sent: action=$action locale=$localeTag")
+            true
         } catch (e: Exception) {
-            // swallow - test should continue
+            Log.w(TAG, "Locale switch failed: ${'$'}{e.message}")
+            false
         }
-
-        // Examples (commented):
-        // AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(localeTag))
-        // Save to SharedPreferences or DataStore and have app read it on startup
     }
 }
 """
@@ -222,10 +263,12 @@ object PlayPulseLocaleHelper {
     def _kotlin_playpulse_test_template(self, package_name: str) -> str:
         template = """package {full_package}
 
+import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import androidx.test.uiautomator.By
 import org.junit.Assert
 import org.junit.Before
 import org.junit.Test
@@ -235,6 +278,7 @@ import java.io.File
 @RunWith(AndroidJUnit4::class)
 class PlayPulseScreenshotTest {
     private lateinit var device: UiDevice
+    private val TAG = "PlayPulseScreenshotTest"
 
     @Before
     fun setUp() {
@@ -243,26 +287,49 @@ class PlayPulseScreenshotTest {
         device.pressHome()
     }
 
-    @Test
-    fun captureAndSaveScreenshot() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val pkg = PlayPulseTestConfig.PACKAGE_NAME
-        PlayPulseLocaleHelper.setAppLocale(instrumentation, pkg, PlayPulseTestConfig.DEFAULT_LOCALES[0])
-
+    private fun launchApp(instrumentation: androidx.test.platform.app.Instrumentation, pkg: String) {
+        Log.i(TAG, "Launching app: $pkg")
         val launchIntent = instrumentation.targetContext.packageManager.getLaunchIntentForPackage(pkg)
         if (launchIntent != null) {
             launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
             instrumentation.targetContext.startActivity(launchIntent)
+        } else {
+            Log.w(TAG, "Launch intent not found for package: $pkg")
         }
+    }
 
-        device.wait(Until.hasObject(androidx.test.uiautomator.By.pkg(pkg).depth(0)), 10_000)
+    private fun waitForApp(pkg: String, timeoutMs: Long = 10_000L) {
+        device.wait(Until.hasObject(By.pkg(pkg).depth(0)), timeoutMs)
+    }
 
-        val out = PlayPulseScreenshotHelper.takeScreenshot(instrumentation, pkg, PlayPulseTestConfig.DEFAULT_LOCALES[0], PlayPulseTestConfig.DEFAULT_SCREENSHOT_NAMES[0])
-        Assert.assertNotNull("Screenshot file path should not be null", out)
-        if (out != null) {
-            val f = File(out)
-            Assert.assertTrue("Screenshot file should exist", f.exists())
-            Assert.assertTrue("Screenshot file should not be empty", f.length() > 0)
+    @Test
+    fun capturePlayPulseScreenshots() {
+        Log.i(TAG, "Starting PlayPulse screenshot test")
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val pkg = PlayPulseTestConfig.PACKAGE_NAME
+
+        for (locale in PlayPulseTestConfig.DEFAULT_LOCALES) {
+            Log.i(TAG, "Locale started: $locale")
+            val switched = PlayPulseLocaleHelper.setAppLocale(instrumentation, pkg, locale)
+            if (!switched) {
+                Log.w(TAG, "Locale switch was not successful for $locale. Screenshots will be captured in the current app language.")
+            } else {
+                Log.i(TAG, "Locale command sent for $locale")
+            }
+
+            launchApp(instrumentation, pkg)
+            Log.i(TAG, "App launched: $pkg")
+            waitForApp(pkg)
+
+            for (screenshotName in PlayPulseTestConfig.DEFAULT_SCREENSHOT_NAMES) {
+                Log.i(TAG, "Capturing screenshot: $screenshotName (locale=$locale)")
+                val outPath = PlayPulseScreenshotHelper.takeScreenshot(instrumentation, pkg, locale, screenshotName)
+                Log.i(TAG, "Screenshot saved: $outPath")
+                val f = File(outPath)
+                Assert.assertTrue("Screenshot file should exist: $outPath", f.exists())
+                Assert.assertTrue("Screenshot file should not be empty: $outPath", f.length() > 0)
+            }
+
         }
     }
 }

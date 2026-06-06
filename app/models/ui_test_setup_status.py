@@ -47,5 +47,7 @@ class UITestSetupStatus:
 class UITestSetupRequirements:
     files_to_create: Dict[str, str] = field(default_factory=dict)  # path -> content
     gradle_changes: List[str] = field(default_factory=list)  # human-readable diffs/lines to add
+    existing_dependencies: List[str] = field(default_factory=list)
+    added_dependencies: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     can_apply: bool = True

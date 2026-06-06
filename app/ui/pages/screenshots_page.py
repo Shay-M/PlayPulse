@@ -1052,7 +1052,12 @@ class ScreenshotsPage(QWidget):
 
         # Fill gradle preview
         if hasattr(self, "gradle_preview") and gradle_preview:
-            preview_lines = [str(line) for line in getattr(gradle_preview, "gradle_changes", [])]
+            preview_lines: list[str] = []
+            if getattr(gradle_preview, "existing_dependencies", None):
+                preview_lines.append("Already present dependencies: " + ", ".join(gradle_preview.existing_dependencies))
+            if getattr(gradle_preview, "added_dependencies", None):
+                preview_lines.append("Missing dependencies to add: " + ", ".join(gradle_preview.added_dependencies))
+            preview_lines += [str(line) for line in getattr(gradle_preview, "gradle_changes", [])]
             preview_text = "\n\n".join(preview_lines).strip()
             if getattr(gradle_preview, "warnings", None):
                 preview_text += "\n\nWarnings:\n" + "\n".join(gradle_preview.warnings)
@@ -1557,23 +1562,46 @@ class ScreenshotsPage(QWidget):
         self.worker_pool.start(worker)
 
     def _apply_ui_test_templates(self, project_path: str, files_map: dict[str, str]) -> dict[str, list[str]]:
+        results = {"written": [], "skipped": [], "errors": []}
         generator = UITestTemplateGenerator(project_path, "com.example.playpulse")
-        return generator.write_templates(files_map)
+        template_results = generator.write_templates(files_map)
+        gradle_requirements = GradleModifier(project_path).generate_requirements()
+        gradle_results = GradleModifier(project_path).apply_requirements(gradle_requirements)
+
+        results["written"].extend(template_results.get("written", []))
+        results["skipped"].extend(template_results.get("skipped", []))
+        results["errors"].extend(template_results.get("errors", []))
+        results["written"].extend(gradle_results.get("written", []))
+        results["skipped"].extend(gradle_results.get("skipped", []))
+        results["errors"].extend(gradle_results.get("errors", []))
+        results["gradle_written"] = gradle_results.get("written", [])
+        results["gradle_skipped"] = gradle_results.get("skipped", [])
+        results["gradle_errors"] = gradle_results.get("errors", [])
+        return results
 
     def on_ui_test_template_apply_finished(self, result: dict[str, list[str]]) -> None:
         written = result.get("written", [])
         skipped = result.get("skipped", [])
         errors = result.get("errors", [])
+        gradle_written = result.get("gradle_written", [])
+        gradle_skipped = result.get("gradle_skipped", [])
+        gradle_errors = result.get("gradle_errors", [])
         messages: list[str] = []
         if written:
             messages.append(f"Saved {len(written)} files.")
         if skipped:
-            messages.append(f"Skipped existing files: {', '.join(skipped)}")
+            messages.append(f"Skipped existing items: {', '.join(skipped)}")
+        if gradle_written:
+            messages.append(f"Updated Gradle file: {', '.join(gradle_written)}")
+        if gradle_skipped:
+            messages.append(f"Gradle changes skipped: {', '.join(gradle_skipped)}")
         if errors:
             messages.append(f"Errors: {', '.join(errors)}")
+        if gradle_errors:
+            messages.append(f"Gradle errors: {', '.join(gradle_errors)}")
 
-        self.status_badge.set_status("success" if written and not errors else "warning")
-        ok_to_proceed = bool(written and not errors)
+        self.status_badge.set_status("success" if written and not errors and not gradle_errors else "warning")
+        ok_to_proceed = bool(written and not errors and not gradle_errors)
         self.apply_ui_test_templates_button.setEnabled(ok_to_proceed)
         # Enable running connectedAndroidTest only after templates were written successfully
         try:
@@ -1612,7 +1640,12 @@ class ScreenshotsPage(QWidget):
         exit_code = str(result.get("exit_code", "-1"))
         out = result.get("stdout", "")
         err = result.get("stderr", "")
-        self.ui_test_warnings.setPlainText(f"Gradle exit: {exit_code}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}")
+        command = result.get("command", "")
+        message = f"Gradle exit: {exit_code}\n\n"
+        if command:
+            message += f"Command: {command}\n\n"
+        message += f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
+        self.ui_test_warnings.setPlainText(message)
         # If tests succeeded, enable screenshot collection
         if exit_code == "0":
             try:
@@ -1634,25 +1667,70 @@ class ScreenshotsPage(QWidget):
             self.status_badge.set_status("warning", "Package name missing")
             return
 
+        selected_device_serial = self._selected_device_serial()
         self.collect_screenshots_button.setEnabled(False)
         self.status_badge.set_status("info", "Collecting screenshots")
-        worker = Worker(self._collect_screenshots, pkg, str(Path.cwd() / "playpulse_output" / "screenshots" / pkg), self.state.manual_adb_path)
+        worker = Worker(
+            self._collect_screenshots,
+            pkg,
+            str(Path.cwd() / "playpulse_output" / "screenshots" / pkg),
+            selected_device_serial,
+            self.state.manual_adb_path,
+        )
         worker.signals.finished.connect(self.on_screenshots_collected)
         worker.signals.error.connect(self.on_worker_error)
         self.worker_pool.start(worker)
 
-    def _collect_screenshots(self, package_name: str, local_output: str, manual_adb_path: str) -> dict:
+    def _collect_screenshots(
+        self,
+        package_name: str,
+        local_output: str,
+        selected_device_serial: str | None,
+        manual_adb_path: str,
+    ) -> dict:
         collector = ScreenshotCollector(self.adb_service)
-        return collector.collect(package_name, local_output, manual_adb_path)
+        return collector.collect(
+            package_name,
+            local_output,
+            selected_device_serial=selected_device_serial,
+            manual_adb_path=manual_adb_path,
+        )
 
     def on_screenshots_collected(self, result: dict) -> None:
         self.collect_screenshots_button.setEnabled(True)
-        if result.get("error"):
-            self.ui_test_warnings.setPlainText(f"Collect error: {result.get('error')}")
-            self.status_badge.set_status("warning", "Collect failed")
+        message_lines: list[str] = []
+        if result.get("error_message"):
+            message_lines.append(f"Collect error: {result.get('error_message')}")
+        elif not result.get("success"):
+            message_lines.append("Collect failed.")
         else:
-            self.ui_test_warnings.setPlainText(f"Pulled screenshots to: {result.get('pulled_to')}")
-            self.status_badge.set_status("success", "Screenshots collected")
+            message_lines.append("Screenshots collected successfully.")
+            if result.get("device_serial"):
+                message_lines.append(f"Device: {result.get('device_serial')}")
+            if result.get("adb_path_used"):
+                message_lines.append(f"ADB path: {result.get('adb_path_used')}")
+            if result.get("local_output_folder"):
+                message_lines.append(f"Local output folder: {result.get('local_output_folder')}")
+            if result.get("remote_folders_checked"):
+                message_lines.append("Remote folders checked:")
+                for remote_root in result.get("remote_folders_checked", []):
+                    message_lines.append(f"  - {remote_root}")
+            if result.get("pulled_paths"):
+                message_lines.append("Pulled paths:")
+                for pulled in result.get("pulled_paths", []):
+                    message_lines.append(f"  - {pulled}")
+            if result.get("missing_paths"):
+                message_lines.append("Missing remote paths:")
+                for missing in result.get("missing_paths", []):
+                    message_lines.append(f"  - {missing}")
+        if result.get("stdout"):
+            message_lines.append("STDOUT:")
+            message_lines.append(result.get("stdout", ""))
+        if result.get("stderr"):
+            message_lines.append("STDERR:")
+            message_lines.append(result.get("stderr", ""))
+        self.ui_test_warnings.setPlainText("\n".join(message_lines).strip())
+        self.status_badge.set_status("success" if result.get("success") else "warning", "Screenshots collected" if result.get("success") else "Collect failed")
 
     def on_open_android_locale_settings(self) -> None:
         device = self._selected_device()

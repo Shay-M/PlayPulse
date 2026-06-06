@@ -222,7 +222,12 @@ class UITestStrategyPanel(QWidget):
             present = any(dep in f for f in found)
             self.deps_table.setItem(row, 1, QTableWidgetItem("Present" if present else "Missing"))
 
-        preview_lines = [str(line) for line in getattr(gradle_preview, "gradle_changes", [])]
+        preview_lines: list[str] = []
+        if getattr(gradle_preview, "existing_dependencies", None):
+            preview_lines.append("Already present dependencies: " + ", ".join(gradle_preview.existing_dependencies))
+        if getattr(gradle_preview, "added_dependencies", None):
+            preview_lines.append("Missing dependencies to add: " + ", ".join(gradle_preview.added_dependencies))
+        preview_lines += [str(line) for line in getattr(gradle_preview, "gradle_changes", [])]
         preview_text = "\n\n".join(preview_lines).strip()
         if getattr(gradle_preview, "warnings", None):
             preview_text += "\n\nWarnings:\n" + "\n".join(gradle_preview.warnings)
@@ -298,22 +303,46 @@ class UITestStrategyPanel(QWidget):
         self.worker_pool.start(worker)
 
     def _apply_ui_test_templates(self, project_path: str, files_map: dict[str, str]) -> dict[str, list[str]]:
+        results = {"written": [], "skipped": [], "errors": []}
         generator = UITestTemplateGenerator(project_path, self.package_name or self.state.detected_package_name)
-        return generator.write_templates(files_map)
+        template_results = generator.write_templates(files_map)
+        gradle_requirements = GradleModifier(project_path).generate_requirements()
+        gradle_results = GradleModifier(project_path).apply_requirements(gradle_requirements)
+
+        results["written"].extend(template_results.get("written", []))
+        results["skipped"].extend(template_results.get("skipped", []))
+        results["errors"].extend(template_results.get("errors", []))
+        results["written"].extend(gradle_results.get("written", []))
+        results["skipped"].extend(gradle_results.get("skipped", []))
+        results["errors"].extend(gradle_results.get("errors", []))
+        results["gradle_written"] = gradle_results.get("written", [])
+        results["gradle_skipped"] = gradle_results.get("skipped", [])
+        results["gradle_errors"] = gradle_results.get("errors", [])
+        return results
 
     def on_ui_test_template_apply_finished(self, result: dict[str, list[str]]) -> None:
         written = result.get("written", [])
         skipped = result.get("skipped", [])
         errors = result.get("errors", [])
+        gradle_written = result.get("gradle_written", [])
+        gradle_skipped = result.get("gradle_skipped", [])
+        gradle_errors = result.get("gradle_errors", [])
+
         messages: list[str] = []
         if written:
             messages.append(f"Saved {len(written)} files.")
         if skipped:
-            messages.append(f"Skipped existing files: {', '.join(skipped)}")
+            messages.append(f"Skipped existing items: {', '.join(skipped)}")
+        if gradle_written:
+            messages.append(f"Updated Gradle file: {', '.join(gradle_written)}")
+        if gradle_skipped:
+            messages.append(f"Gradle changes skipped: {', '.join(gradle_skipped)}")
         if errors:
             messages.append(f"Errors: {', '.join(errors)}")
+        if gradle_errors:
+            messages.append(f"Gradle errors: {', '.join(gradle_errors)}")
 
-        ok_to_proceed = bool(written and not errors)
+        ok_to_proceed = bool(written and not errors and not gradle_errors)
         self.apply_ui_test_templates_button.setEnabled(ok_to_proceed)
         self.run_connected_tests_button.setEnabled(ok_to_proceed)
         self.ui_test_warnings.setPlainText("\n".join(messages).strip())
@@ -339,14 +368,19 @@ class UITestStrategyPanel(QWidget):
 
     def _run_connected_android_test(self, project_path: str, app_module_path: str) -> dict:
         runner = GradleRunner(project_path)
-        return runner.run_connected_android_test(app_module_path)
+        return runner.run_connected_android_test(app_module_path=app_module_path)
 
     def on_connected_tests_finished(self, result: dict) -> None:
         self.run_connected_tests_button.setEnabled(True)
         exit_code = str(result.get("exit_code", "-1"))
         out = result.get("stdout", "")
         err = result.get("stderr", "")
-        self.ui_test_warnings.setPlainText(f"Gradle exit: {exit_code}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}")
+        command = result.get("command", "")
+        message = f"Gradle exit: {exit_code}\n\n"
+        if command:
+            message += f"Command: {command}\n\n"
+        message += f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
+        self.ui_test_warnings.setPlainText(message)
         if exit_code == "0":
             self.collect_screenshots_button.setEnabled(True)
             self._set_status("success", "Tests finished")
@@ -384,12 +418,47 @@ class UITestStrategyPanel(QWidget):
 
     def on_screenshots_collected(self, result: dict) -> None:
         self.collect_screenshots_button.setEnabled(True)
-        if result.get("error"):
-            self.ui_test_warnings.setPlainText(f"Collect error: {result.get('error')}")
-            self._set_status("warning", "Collect failed")
+        device_serial = result.get("device_serial", "")
+        adb_path = result.get("adb_path_used", "")
+        local_output = result.get("local_output_folder", "")
+        remote_folders = result.get("remote_folders_checked", [])
+
+        if result.get("error_message"):
+            message_lines = [f"Collect error: {result.get('error_message')}" ]
+        elif not result.get("success"):
+            message_lines = ["Collect failed."]
         else:
-            self.ui_test_warnings.setPlainText(result.get("message", "Screenshots pulled."))
+            message_lines = ["Screenshots collected successfully."]
+            if device_serial:
+                message_lines.append(f"Device: {device_serial}")
+            if adb_path:
+                message_lines.append(f"ADB path: {adb_path}")
+            if local_output:
+                message_lines.append(f"Local output folder: {local_output}")
+            if remote_folders:
+                message_lines.append("Remote folders checked:")
+                for remote_root in remote_folders:
+                    message_lines.append(f"  - {remote_root}")
+            if result.get("pulled_paths"):
+                message_lines.append("Pulled paths:")
+                for pulled in result.get("pulled_paths", []):
+                    message_lines.append(f"  - {pulled}")
+            if result.get("missing_paths"):
+                message_lines.append("Missing remote paths:")
+                for missing in result.get("missing_paths", []):
+                    message_lines.append(f"  - {missing}")
+        if result.get("stdout"):
+            message_lines.append("STDOUT:")
+            message_lines.append(result.get("stdout", ""))
+        if result.get("stderr"):
+            message_lines.append("STDERR:")
+            message_lines.append(result.get("stderr", ""))
+
+        self.ui_test_warnings.setPlainText("\n".join(message_lines).strip())
+        if result.get("success"):
             self._set_status("success", "Screenshots collected")
+        else:
+            self._set_status("warning", "Collect failed")
 
     def on_worker_error(self, error: str) -> None:
         self._set_status("error", "Worker error")
