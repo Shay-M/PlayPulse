@@ -195,6 +195,17 @@ class ScreenshotService:
                     self.adb_service.wait(options.wait_for_widget_render_seconds)
             return
 
+        if mode in {"device_language_command_reboot", "combined_device_command_reboot"}:
+            if progress_callback:
+                progress_callback({"message": f"Setting Android system locale to {locale}"})
+            self.adb_service.set_system_locale(device.identifier, locale, manual_adb_path)
+            if progress_callback:
+                progress_callback({"message": "Rebooting Android device after system locale change"})
+            self.adb_service.reboot_device(device.identifier, manual_adb_path)
+            if progress_callback:
+                progress_callback({"message": "Waiting for Android device after reboot"})
+            self.adb_service.wait_for_device_ready(device.identifier, manual_adb_path)
+
         if mode in {"device_language_command_assisted", "device_language_recorded_flow", "combined"}:
             flow_name = locale_preparation_settings.device_language_flows.get(locale, "")
             if mode == "device_language_recorded_flow" and not flow_name:
@@ -219,14 +230,14 @@ class ScreenshotService:
                     progress_callback,
                 )
 
-        if mode in {"app_debug_command", "combined"}:
+        if mode in {"app_debug_command", "combined", "combined_device_command_reboot"}:
             command_settings = locale_preparation_settings.app_debug_command
             if command_settings.type == "deep_link":
-                if mode == "combined" and not command_settings.template.strip():
+                if mode in {"combined", "combined_device_command_reboot"} and not command_settings.template.strip():
                     command_settings = None
                 elif not command_settings.template.strip():
                     raise RuntimeError("App debug deep link template is not configured.")
-            elif mode == "combined" and not command_settings.action.strip():
+            elif mode in {"combined", "combined_device_command_reboot"} and not command_settings.action.strip():
                 command_settings = None
             elif not command_settings.action.strip():
                 raise RuntimeError("App debug broadcast action is not configured.")
@@ -248,7 +259,7 @@ class ScreenshotService:
                     manual_adb_path,
                 )
 
-        if mode in {"in_app_recorded_language_flow", "combined"}:
+        if mode in {"in_app_recorded_language_flow", "combined", "combined_device_command_reboot"}:
             flow_name = locale_preparation_settings.app_language_flows.get(locale, "")
             if mode == "in_app_recorded_language_flow" and not flow_name:
                 raise RuntimeError(f"No app language flow is assigned for {locale}.")

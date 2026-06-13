@@ -43,11 +43,13 @@ from app.services.gradle_modifier import GradleModifier
 from app.services.ui_test_template_generator import UITestTemplateGenerator
 from app.services.screenshot_collector import ScreenshotCollector
 from app.services.gradle_runner import GradleRunner
+from app.services.screenshot_strategy import InstrumentedScreenshotStrategy
 from app.models.screenshot_strategy import ScreenshotStrategy
 from app.models.ui_test_setup_status import UITestSetupStatus
 from app.ui.components.progress_panel import ProgressPanel
 from app.ui.components.status_badge import StatusBadge
 from app.ui.components.ui_test_strategy_panel import UITestStrategyPanel
+from app.ui.components.app_locale_bridge_panel import AppLocaleBridgePanel
 from app.ui.workers import Worker
 
 
@@ -61,8 +63,10 @@ class ScreenshotsPage(QWidget):
         ],
         "widget_home_screen": [
             ("Current language only", "none"),
+            ("Device language command with reboot", "device_language_command_reboot"),
             ("Device language recorded flow", "device_language_recorded_flow"),
-            ("Combined: device + app language", "combined"),
+            ("Combined: system command + app language", "combined_device_command_reboot"),
+            ("Combined: recorded device + app language", "combined"),
         ],
     }
 
@@ -124,7 +128,8 @@ class ScreenshotsPage(QWidget):
         title_box.addWidget(subtitle)
         # Strategy selector (recommended: UI Test / Screenshot Test)
         self.strategy_selector = QComboBox()
-        self.strategy_selector.addItem("Recommended: UI Test / Screenshot Test", "ui_test")
+        self.strategy_selector.addItem("Recommended: App Debug Command + ADB Capture", "app_debug_adb")
+        self.strategy_selector.addItem("UI Test / Screenshot Test (advanced)", "ui_test")
         self.strategy_selector.addItem("Manual ADB Capture", "manual_adb")
         self.strategy_selector.addItem("Internal ADB Flow Engine", "internal_adb_flow")
         self.strategy_selector.addItem("Widget / Device Language Capture", "widget_language")
@@ -309,7 +314,6 @@ class ScreenshotsPage(QWidget):
         self.steps_tabs.addTab(device_page, "Device & ADB")
 
         capture_target_page = QWidget()
-        self.steps_tabs.addTab(capture_target_page, "Capture Target")
         capture_target_layout = QVBoxLayout(capture_target_page)
         # UI Test Setup tab (hidden unless UI Test strategy selected)
         ui_test_setup_page = QWidget()
@@ -334,6 +338,22 @@ class ScreenshotsPage(QWidget):
             self.steps_tabs.setTabVisible(self.ui_test_setup_index, is_ui)
         except Exception:
             pass
+
+        locale_bridge_page = QWidget()
+        locale_bridge_layout = QVBoxLayout(locale_bridge_page)
+        locale_bridge_layout.setContentsMargins(16, 16, 16, 16)
+        locale_bridge_layout.setSpacing(14)
+        self.app_locale_bridge_panel = AppLocaleBridgePanel(
+            self.state,
+            self.log_service,
+            self.settings_service,
+            self.worker_pool,
+            lambda level, text: self.status_badge.set_status(level, text),
+        )
+        locale_bridge_layout.addWidget(self.app_locale_bridge_panel)
+        self.locale_bridge_index = self.steps_tabs.addTab(locale_bridge_page, "Locale Bridge")
+        # The Locale Bridge tab belongs to the recommended App Debug Command strategy.
+        # Keep tab indexes stable by adding each widget only once.
         capture_target_layout.setContentsMargins(0, 0, 0, 0)
         capture_target_layout.setSpacing(16)
         capture_target_layout.addWidget(self._build_capture_target_card())
@@ -522,6 +542,8 @@ class ScreenshotsPage(QWidget):
         main_layout.addWidget(self.steps_tabs)
 
         self.refresh_from_state()
+        self._apply_strategy_defaults()
+        self._update_ui_test_tab_visibility()
         self.on_refresh_devices()
 
     def _add_setup_row(
@@ -1033,7 +1055,7 @@ class ScreenshotsPage(QWidget):
         self.detail_app_module.setText(f"App module: {status.app_module_path or 'N/A'}")
         self.detail_namespace.setText(f"Namespace: {status.namespace or status.package_name or 'N/A'}")
         self.detail_application_id.setText(f"ApplicationId: {status.application_id or 'N/A'}")
-        test_pkg = status.namespace or status.package_name or status.application_id or ""
+        test_pkg = status.application_id or status.package_name or status.namespace or ""
         test_pkg_path = test_pkg.replace('.', '/') if test_pkg else 'N/A'
         self.detail_package_path.setText(f"Test package path: {test_pkg_path}")
         self.detail_gradle_type.setText(f"Gradle DSL: {status.gradle_dsl or 'N/A'}")
@@ -1117,7 +1139,9 @@ class ScreenshotsPage(QWidget):
             "App debug command": "app_debug_command",
             "In-app recorded language flow": "in_app_recorded_language_flow",
             "Device language command / assisted mode": "device_language_command_assisted",
+            "Device language command with reboot": "device_language_command_reboot",
             "Device language recorded flow": "device_language_recorded_flow",
+            "Combined: system command + app language": "combined_device_command_reboot",
             "Combined mode": "combined",
             "Combined: device + app language": "combined",
         }
@@ -1129,14 +1153,18 @@ class ScreenshotsPage(QWidget):
                 return label
         if mode_value == "device_language_command_assisted":
             return "Device language recorded flow"
+        if mode_value == "device_language_command_reboot":
+            return "Device language command with reboot"
+        if mode_value == "combined_device_command_reboot":
+            return "Combined: system command + app language"
         return "Current language only"
 
     def _update_locale_prep_visibility(self) -> None:
         mode = self._mode_value_from_ui()
         self.state.locale_preparation_settings.capture_target_type = self._capture_target_value()
         self.state.locale_preparation_settings.locale_preparation_mode = mode
-        app_mode = mode in {"app_debug_command", "combined"}
-        app_flow_mode = mode in {"in_app_recorded_language_flow", "combined"}
+        app_mode = mode in {"app_debug_command", "combined", "combined_device_command_reboot"}
+        app_flow_mode = mode in {"in_app_recorded_language_flow", "combined", "combined_device_command_reboot"}
         device_flow_mode = mode in {"device_language_command_assisted", "device_language_recorded_flow", "combined"}
         deep_link_mode = app_mode and self.app_debug_type_selector.currentText() == "Deep link"
         broadcast_mode = app_mode and self.app_debug_type_selector.currentText() == "Broadcast"
@@ -1169,9 +1197,13 @@ class ScreenshotsPage(QWidget):
             warnings.append(
                 "Multiple locales are selected, but no locale preparation is configured. All screenshots may be captured in the same language."
             )
-        if target == "widget_home_screen" and mode not in {"device_language_recorded_flow", "combined"}:
+        if target == "widget_home_screen" and mode not in {"device_language_command_reboot", "combined_device_command_reboot", "device_language_recorded_flow", "combined"}:
             warnings.append(
                 "Widget screenshots may still use the current Android system language. Device language preparation is recommended for widgets."
+            )
+        if mode in {"device_language_command_reboot", "combined_device_command_reboot"}:
+            warnings.append(
+                "Device language command changes Android system_locales and reboots the device. This is slow but useful for widgets."
             )
         self.locale_prep_warning_label.setText(" \n".join(warnings) if warnings else "")
         self._update_locale_readiness()
@@ -1213,7 +1245,7 @@ class ScreenshotsPage(QWidget):
             self.state.locale_preparation_settings.app_debug_command.template = self.app_deep_link_input.text().strip()
             preview = f"\"{adb_path}\" -s {device_serial} shell am start -a android.intent.action.VIEW -d \"{deep_link}\""
         else:
-            action = self.broadcast_action_input.text().strip() or "com.example.app.PLAYPULSE_SET_LOCALE"
+            action = self.broadcast_action_input.text().strip() or self._default_broadcast_action() or "com.example.app.PLAYPULSE_SET_LOCALE"
             extra_key = self.broadcast_extra_key_input.text().strip() or "locale"
             extra_value = self.broadcast_extra_value_input.text().strip() or "{locale}"
             self.state.locale_preparation_settings.app_debug_command.type = "broadcast"
@@ -1288,7 +1320,8 @@ class ScreenshotsPage(QWidget):
         validate_locale_preparation: bool = True,
     ) -> list[str]:
         reasons: list[str] = []
-        if not flows:
+        using_ui_test_strategy = self.state.strategy_mode == ScreenshotStrategy.UI_TEST
+        if not flows and not using_ui_test_strategy:
             reasons.append(
                 "No screenshot flow selected. Choose a flow from the dropdown or select one in the Flows tab."
             )
@@ -1303,15 +1336,23 @@ class ScreenshotsPage(QWidget):
         if not output_folder or not self.adb_service.is_output_folder_writable(output_folder):
             reasons.append("Output folder not writable.")
 
-        if backend in {"Real ADB screencap", "Maestro flow + ADB screencap"}:
+        if backend in {"Real ADB screencap", "Maestro flow + ADB screencap"} or using_ui_test_strategy:
             path_info = self.adb_service.resolve_adb_path(self.state.manual_adb_path)
             if not path_info.found:
                 reasons.append("ADB path invalid.")
 
+        if using_ui_test_strategy:
+            if not self.state.selected_project_path.strip():
+                reasons.append("Android project path is required for UI Test screenshot capture.")
+            if not self._ui_test_runtime_package_name():
+                reasons.append("Package name is required for UI Test screenshot capture. Analyze the Android project first.")
+
+        runtime_package_name = self._ui_test_runtime_package_name() if using_ui_test_strategy else self.state.detected_package_name.strip()
+
         if backend == "Maestro flow + ADB screencap" and any(not flow.automation_path for flow in flows):
             reasons.append("Maestro capture requires flows loaded from .yaml or .yml files.")
 
-        if self.launch_before_capture_checkbox.isChecked() and not self.state.detected_package_name.strip():
+        if self.launch_before_capture_checkbox.isChecked() and not runtime_package_name:
             reasons.append(
                 "Package name is required for launch-before-capture. Scan the Android project first or disable this option."
             )
@@ -1321,7 +1362,7 @@ class ScreenshotsPage(QWidget):
         if (
             settings.locale_preparation_mode != "none"
             and (options.force_stop_after_locale_change or options.relaunch_after_locale_change)
-            and not self.state.detected_package_name.strip()
+            and not runtime_package_name
         ):
             reasons.append(
                 "Package name is required for force stop/relaunch. Scan the Android project first or disable these options."
@@ -1421,7 +1462,7 @@ class ScreenshotsPage(QWidget):
         settings.locale_preparation_mode = self._mode_value_from_ui()
         settings.app_debug_command.type = "deep_link" if self.app_debug_type_selector.currentText() == "Deep link" else "broadcast"
         settings.app_debug_command.template = self.app_deep_link_input.text().strip()
-        settings.app_debug_command.action = self.broadcast_action_input.text().strip()
+        settings.app_debug_command.action = self.broadcast_action_input.text().strip() or self._default_broadcast_action()
         settings.app_debug_command.extra_key = self.broadcast_extra_key_input.text().strip() or "locale"
         settings.app_debug_command.extra_value = self.broadcast_extra_value_input.text().strip() or "{locale}"
         settings.common_options.force_stop_after_locale_change = self.force_stop_checkbox.isChecked()
@@ -1470,6 +1511,44 @@ class ScreenshotsPage(QWidget):
         self.status_badge.set_status("success", "Android info detected")
         self.log_service.success("Android device information detected.")
 
+    def _apply_strategy_defaults(self) -> None:
+        strategy = self.state.strategy_mode
+        if strategy == ScreenshotStrategy.APP_DEBUG_ADB:
+            self.capture_backend_selector.setCurrentText("Real ADB screencap")
+            self.capture_target_selector.setCurrentText("In-app screen")
+            self._set_language_mode_options("in_app_screen")
+            self.locale_preparation_mode_selector.setCurrentText("App debug command")
+            self.app_debug_type_selector.setCurrentText("Broadcast")
+            default_action = self._default_broadcast_action()
+            if default_action and not self.broadcast_action_input.text().strip():
+                self.broadcast_action_input.setText(default_action)
+            self.launch_before_capture_checkbox.setChecked(True)
+        elif strategy == ScreenshotStrategy.WIDGET_LANGUAGE:
+            self.capture_backend_selector.setCurrentText("Real ADB screencap")
+            self.capture_target_selector.setCurrentText("Widget / Home screen")
+            self._set_language_mode_options("widget_home_screen")
+            self.locale_preparation_mode_selector.setCurrentText("Device language command with reboot")
+            self.launch_before_capture_checkbox.setChecked(False)
+        elif strategy == ScreenshotStrategy.MANUAL_ADB:
+            self.capture_backend_selector.setCurrentText("Real ADB screencap")
+            self.locale_preparation_mode_selector.setCurrentText("Current language only")
+        elif strategy == ScreenshotStrategy.INTERNAL_ADB_FLOW:
+            self.capture_backend_selector.setCurrentText("Internal ADB Flow Engine")
+        elif strategy == ScreenshotStrategy.MAESTRO:
+            self.capture_backend_selector.setCurrentText("Maestro flow + ADB screencap")
+        self._update_locale_prep_visibility()
+        self._update_locale_prep_warning()
+
+    def _default_broadcast_action(self) -> str:
+        package_name = (
+            self.state.detected_package_name.strip()
+            or self._ui_test_runtime_package_name()
+            or ""
+        )
+        if not package_name:
+            return ""
+        return f"{package_name}.PLAYPULSE_SET_LOCALE"
+
     def on_strategy_changed(self, index: int) -> None:
         try:
             value = self.strategy_selector.itemData(index)
@@ -1481,9 +1560,10 @@ class ScreenshotsPage(QWidget):
                 self.state.strategy_mode = ScreenshotStrategy.default()
             # Persist selection
             try:
-                    self.settings_service.save_screenshot_strategy(str(self.state.strategy_mode.value))
+                self.settings_service.save_screenshot_strategy(str(self.state.strategy_mode.value))
             except Exception:
                 pass
+            self._apply_strategy_defaults()
             self._update_ui_test_tab_visibility()
             self.log_service.info(f"Screenshot strategy set to {self.state.strategy_mode}")
         except Exception:
@@ -1491,8 +1571,11 @@ class ScreenshotsPage(QWidget):
 
     def _update_ui_test_tab_visibility(self) -> None:
         try:
-            visible = self.state.strategy_mode == ScreenshotStrategy.UI_TEST
-            self.steps_tabs.setTabVisible(self.ui_test_setup_index, visible)
+            ui_visible = self.state.strategy_mode == ScreenshotStrategy.UI_TEST
+            bridge_visible = self.state.strategy_mode == ScreenshotStrategy.APP_DEBUG_ADB
+            self.steps_tabs.setTabVisible(self.ui_test_setup_index, ui_visible)
+            if hasattr(self, "locale_bridge_index"):
+                self.steps_tabs.setTabVisible(self.locale_bridge_index, bridge_visible)
         except Exception:
             pass
 
@@ -1509,9 +1592,9 @@ class ScreenshotsPage(QWidget):
         package_name = ""
         if self.last_ui_test_analysis_status:
             package_name = (
-                self.last_ui_test_analysis_status.namespace
+                self.last_ui_test_analysis_status.application_id
                 or self.last_ui_test_analysis_status.package_name
-                or self.last_ui_test_analysis_status.application_id
+                or self.last_ui_test_analysis_status.namespace
             )
         if not package_name:
             package_name = self.state.detected_package_name
@@ -1531,7 +1614,13 @@ class ScreenshotsPage(QWidget):
         self.worker_pool.start(worker)
 
     def _generate_ui_test_templates(self, project_path: str, package_name: str) -> dict[str, str]:
-        generator = UITestTemplateGenerator(project_path, package_name)
+        app_module_path = self.last_ui_test_analysis_status.app_module_path if self.last_ui_test_analysis_status else "app"
+        generator = UITestTemplateGenerator(
+            project_path,
+            package_name,
+            app_module_path=app_module_path or "app",
+            locales=self.state.selected_locale_codes() or ["current"],
+        )
         return generator.generate_templates()
 
     def on_ui_test_template_preview_finished(self, result: dict[str, str]) -> None:
@@ -1563,7 +1652,22 @@ class ScreenshotsPage(QWidget):
 
     def _apply_ui_test_templates(self, project_path: str, files_map: dict[str, str]) -> dict[str, list[str]]:
         results = {"written": [], "skipped": [], "errors": []}
-        generator = UITestTemplateGenerator(project_path, "com.example.playpulse")
+        package_name = self.state.detected_package_name
+        app_module_path = "app"
+        if self.last_ui_test_analysis_status:
+            package_name = (
+                self.last_ui_test_analysis_status.application_id
+                or self.last_ui_test_analysis_status.package_name
+                or self.last_ui_test_analysis_status.namespace
+                or package_name
+            )
+            app_module_path = self.last_ui_test_analysis_status.app_module_path or app_module_path
+        generator = UITestTemplateGenerator(
+            project_path,
+            package_name,
+            app_module_path=app_module_path,
+            locales=self.state.selected_locale_codes() or ["current"],
+        )
         template_results = generator.write_templates(files_map)
         gradle_requirements = GradleModifier(project_path).generate_requirements()
         gradle_results = GradleModifier(project_path).apply_requirements(gradle_requirements)
@@ -1601,7 +1705,7 @@ class ScreenshotsPage(QWidget):
             messages.append(f"Gradle errors: {', '.join(gradle_errors)}")
 
         self.status_badge.set_status("success" if written and not errors and not gradle_errors else "warning")
-        ok_to_proceed = bool(written and not errors and not gradle_errors)
+        ok_to_proceed = bool((written or skipped or gradle_written or gradle_skipped) and not errors and not gradle_errors)
         self.apply_ui_test_templates_button.setEnabled(ok_to_proceed)
         # Enable running connectedAndroidTest only after templates were written successfully
         try:
@@ -1657,9 +1761,9 @@ class ScreenshotsPage(QWidget):
         pkg = ""
         if self.last_ui_test_analysis_status:
             pkg = (
-                self.last_ui_test_analysis_status.namespace
+                self.last_ui_test_analysis_status.application_id
                 or self.last_ui_test_analysis_status.package_name
-                or self.last_ui_test_analysis_status.application_id
+                or self.last_ui_test_analysis_status.namespace
             )
         if not pkg:
             pkg = self.state.detected_package_name
@@ -3123,6 +3227,24 @@ class ScreenshotsPage(QWidget):
         self.capture_current_language_test_button.setEnabled(False)
         self.status_badge.set_status("info", "Capturing")
         self.progress_panel.reset("Starting screenshot capture")
+        if self.state.strategy_mode == ScreenshotStrategy.UI_TEST:
+            package_name = self._ui_test_runtime_package_name()
+            app_module_path = self._ui_test_app_module_path()
+            self.log_service.info(f"Starting instrumented UI tests for {len(locales)} locale(s).")
+            worker = Worker(
+                self._run_instrumented_screenshot_strategy,
+                locales,
+                output_folder,
+                device.identifier,
+                package_name,
+                app_module_path,
+                progress_callback=None,
+            )
+            worker.signals.progress.connect(self.on_capture_progress)
+            worker.signals.finished.connect(self.on_instrumented_capture_finished)
+            worker.signals.error.connect(self.on_worker_error)
+            self.worker_pool.start(worker)
+            return
         if backend == "Internal ADB Flow Engine":
             self.capture_button.setEnabled(True)
             self.capture_selected_button.setEnabled(True)
@@ -3174,6 +3296,72 @@ class ScreenshotsPage(QWidget):
         self.status_badge.set_status("success", "Captured")
         self.log_service.success("Screenshot capture completed.")
         self._update_diagnostics_from_service()
+
+    def _run_instrumented_screenshot_strategy(
+        self,
+        locales: List[str],
+        output_folder: str,
+        device_serial: str,
+        package_name: str,
+        app_module_path: str,
+        progress_callback=None,
+    ) -> dict:
+        strategy = InstrumentedScreenshotStrategy(
+            self.state.selected_project_path,
+            package_name,
+            adb_service=self.adb_service,
+            internal_flow_service=self.internal_flow_service,
+        )
+        device = DeviceInfo(device_serial, "Android device", "device")
+        return strategy.run(
+            locales,
+            local_output_root=output_folder,
+            device=device,
+            locale_preparation_settings=self.state.locale_preparation_settings,
+            internal_flows=self.state.internal_flows,
+            app_module_path=app_module_path,
+            manual_adb_path=self.state.manual_adb_path,
+            selected_device_serial=device_serial,
+            progress_callback=progress_callback,
+        )
+
+    def on_instrumented_capture_finished(self, result: dict) -> None:
+        paths = self._instrumented_result_paths(result)
+        self.capture_button.setEnabled(True)
+        self.capture_selected_button.setEnabled(True)
+        self.capture_widget_button.setEnabled(True)
+        self.capture_current_language_test_button.setEnabled(True)
+        self.state.screenshot_results = paths
+        self.state.deployment_status.screenshots_captured = bool(paths)
+        for flow in self.state.screenshot_flows:
+            if flow.status == "Running":
+                flow.status = "Captured" if paths else "Pending"
+        self.refresh_flow_table()
+        self._update_preview_cards()
+
+        errors = result.get("errors", [])
+        if result.get("success"):
+            self.progress_panel.set_status("Instrumented screenshot capture completed", 100)
+            self.status_badge.set_status("success", "Captured")
+            self.log_service.success("Instrumented screenshot capture completed.")
+        else:
+            message = "; ".join(errors) if errors else "Instrumented screenshot capture did not complete."
+            self.progress_panel.set_status("Instrumented screenshot capture failed", 0)
+            self.status_badge.set_status("warning", "Capture failed")
+            self.log_service.warning(message)
+        self._update_diagnostics_from_service()
+
+    def _instrumented_result_paths(self, result: dict) -> dict[str, str]:
+        paths: dict[str, str] = {}
+        for locale_result in result.get("results", []):
+            locale = str(locale_result.get("locale", "default"))
+            collect_result = locale_result.get("collect_result", {}) or {}
+            for pulled_path in collect_result.get("pulled_paths", []):
+                path = Path(pulled_path)
+                if path.suffix.lower() != ".png":
+                    continue
+                paths[f"{locale}:{path.stem}"] = str(path)
+        return paths
 
     def on_worker_error(self, message: str) -> None:
         self.refresh_button.setEnabled(True)
@@ -3255,6 +3443,21 @@ class ScreenshotsPage(QWidget):
     def _selected_device_serial(self) -> str:
         device = self._selected_device()
         return device.identifier if device else ""
+
+    def _ui_test_runtime_package_name(self) -> str:
+        if self.last_ui_test_analysis_status:
+            return (
+                self.last_ui_test_analysis_status.application_id
+                or self.last_ui_test_analysis_status.package_name
+                or self.last_ui_test_analysis_status.namespace
+                or self.state.detected_package_name
+            ).strip()
+        return self.state.detected_package_name.strip()
+
+    def _ui_test_app_module_path(self) -> str:
+        if self.last_ui_test_analysis_status and self.last_ui_test_analysis_status.app_module_path:
+            return self.last_ui_test_analysis_status.app_module_path
+        return "app"
 
     def _selected_internal_flow_index(self) -> int | None:
         selected_rows = self.internal_flow_table.selectionModel().selectedRows()
@@ -3363,6 +3566,12 @@ class ScreenshotsPage(QWidget):
             return InternalFlowStep("enter_text", text="sample")
         if step_type == "take_screenshot":
             return InternalFlowStep("take_screenshot", name=self._safe_flow_name(flow.name))
+        if step_type == "set_system_locale":
+            return InternalFlowStep("set_system_locale", text="{locale}")
+        if step_type == "reboot_device":
+            return InternalFlowStep("reboot_device")
+        if step_type == "wait_for_device_ready":
+            return InternalFlowStep("wait_for_device_ready", seconds=180)
         if step_type == "run_deep_link":
             return InternalFlowStep("run_deep_link", text="myapp://playpulse/set-locale?locale={locale}")
         if step_type == "run_broadcast":

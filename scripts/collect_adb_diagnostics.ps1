@@ -1,7 +1,36 @@
 Param(
     [string]$Serial = "",
-    [string]$AdbPath = ""
+    [string]$AdbPath = "",
+    [string]$PackageName = "com.silverhorse.speakerclock"
 )
+
+function Resolve-AdbPath {
+    if ($AdbPath -and (Test-Path $AdbPath)) {
+        return $AdbPath
+    }
+    $pathAdb = Get-Command adb -ErrorAction SilentlyContinue
+    if ($pathAdb) {
+        return $pathAdb.Source
+    }
+    $localAdb = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
+    if (Test-Path $localAdb) {
+        return $localAdb
+    }
+    throw "adb not found. Pass -AdbPath or install Android Platform Tools."
+}
+
+function Build-Args {
+    param([string[]]$Parts)
+    $all = New-Object System.Collections.Generic.List[string]
+    if ($Serial -and $Serial.Trim().Length -gt 0) {
+        $all.Add("-s")
+        $all.Add($Serial.Trim())
+    }
+    foreach ($part in $Parts) {
+        $all.Add($part)
+    }
+    return $all.ToArray()
+}
 
 function Run-ADB {
     param(
@@ -10,20 +39,18 @@ function Run-ADB {
     )
     $errFile = "$OutFile.err"
     try {
-        Start-Process -FilePath $adbCmd -ArgumentList $Args -NoNewWindow -Wait -RedirectStandardOutput $OutFile -RedirectStandardError $errFile
+        & $script:adbCmd @Args 1> $OutFile 2> $errFile
+        "exit_code=$LASTEXITCODE" | Out-File -Append -FilePath $OutFile -Encoding utf8
     } catch {
-        "ERROR running: adb $($Args -join ' ')" | Out-File -FilePath $OutFile -Encoding utf8
+        "ERROR running: $script:adbCmd $($Args -join ' ')" | Out-File -FilePath $OutFile -Encoding utf8
         "Exception: $($_.Exception.Message)" | Out-File -FilePath $errFile -Encoding utf8
     }
 }
 
-# determine adb command: use provided path or system adb
-if ($AdbPath -and (Test-Path $AdbPath)) {
-    $adbCmd = $AdbPath
-} elseif (Get-Command adb -ErrorAction SilentlyContinue) {
-    $adbCmd = (Get-Command adb).Source
-} else {
-    Write-Error "adb not found in PATH and no -AdbPath provided. Install Android Platform Tools or pass -AdbPath '<full path to adb.exe>'"
+try {
+    $script:adbCmd = Resolve-AdbPath
+} catch {
+    Write-Error $_.Exception.Message
     exit 2
 }
 
@@ -31,59 +58,48 @@ $ts = Get-Date -Format "yyyyMMdd_HHmmss"
 $outDir = "playpulse_adb_diag_$ts"
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-# common helper to build args with optional -s
-function Build-Args([string[]]$parts) {
-    if ($Serial -and $Serial.Trim().Length -gt 0) {
-        return ,"-s",$Serial + $parts
-    }
-    return $parts
-}
+"adb=$script:adbCmd" | Out-File -FilePath (Join-Path $outDir "diagnostics_meta.txt") -Encoding utf8
+"serial=$Serial" | Out-File -Append -FilePath (Join-Path $outDir "diagnostics_meta.txt") -Encoding utf8
+"package=$PackageName" | Out-File -Append -FilePath (Join-Path $outDir "diagnostics_meta.txt") -Encoding utf8
 
-# Collect basic info
 Run-ADB -Args (Build-Args @("devices","-l")) -OutFile (Join-Path $outDir "devices.txt")
+Run-ADB -Args (Build-Args @("shell","getprop","ro.build.version.sdk")) -OutFile (Join-Path $outDir "android_sdk.txt")
 Run-ADB -Args (Build-Args @("shell","pm","list","packages")) -OutFile (Join-Path $outDir "packages.txt")
 
-# Check the two expected remote paths
-$remote1 = "/sdcard/Download/PlayPulseScreenshots/com.silverhorse.speakerclock"
-$remote2 = "/sdcard/Android/data/com.silverhorse.speakerclock/files/PlayPulseScreenshots"
-Run-ADB -Args (Build-Args @("shell","ls","-la",$remote1)) -OutFile (Join-Path $outDir "remote_path_download.txt")
-Run-ADB -Args (Build-Args @("shell","ls","-la",$remote2)) -OutFile (Join-Path $outDir "remote_path_android_data.txt")
+$remoteDownload = "/sdcard/Download/PlayPulseScreenshots/$PackageName"
+$remoteAppSpecificLower = "/sdcard/Android/data/$PackageName/files/playpulse_screenshots"
+$remoteAppSpecificLegacy = "/sdcard/Android/data/$PackageName/files/PlayPulseScreenshots"
 
-# Try finding PlayPulseScreenshots directories under /sdcard (may take time)
-Run-ADB -Args (Build-Args @("shell","sh","-c","find /sdcard -maxdepth 4 -type d -name PlayPulseScreenshots 2>/dev/null")) -OutFile (Join-Path $outDir "found_dirs.txt")
+Run-ADB -Args (Build-Args @("shell","ls","-la",$remoteDownload)) -OutFile (Join-Path $outDir "remote_path_download.txt")
+Run-ADB -Args (Build-Args @("shell","ls","-la",$remoteAppSpecificLower)) -OutFile (Join-Path $outDir "remote_path_android_data_lower.txt")
+Run-ADB -Args (Build-Args @("shell","ls","-la",$remoteAppSpecificLegacy)) -OutFile (Join-Path $outDir "remote_path_android_data_legacy.txt")
 
-# Find PNG files (may be large) - limit depth for speed
-Run-ADB -Args (Build-Args @("shell","sh","-c","find /sdcard -type f -name ""*.png"" 2>/dev/null | sed -n '1,200p'")) -OutFile (Join-Path $outDir "png_samples.txt")
-
-# Attempt run-as listing (may fail if app not debuggable)
-Run-ADB -Args (Build-Args @("shell","run-as","com.silverhorse.speakerclock","ls","-la","files")) -OutFile (Join-Path $outDir "run_as_files.txt")
-
-# Logcat dump and filtered PlayPulse entries
+Run-ADB -Args (Build-Args @("shell","sh","-c","find /sdcard -type d \( -name 'PlayPulseScreenshots' -o -name 'playpulse_screenshots' \) 2>/dev/null")) -OutFile (Join-Path $outDir "found_dirs.txt")
+Run-ADB -Args (Build-Args @("shell","sh","-c","find /sdcard -type f -name '*.png' 2>/dev/null | sed -n '1,200p'")) -OutFile (Join-Path $outDir "png_samples.txt")
+Run-ADB -Args (Build-Args @("shell","run-as",$PackageName,"ls","-la","files")) -OutFile (Join-Path $outDir "run_as_files.txt")
 Run-ADB -Args (Build-Args @("logcat","-d")) -OutFile (Join-Path $outDir "logcat_full.txt")
-# Simple filter for PlayPulse tags in logcat (findstr on Windows)
+
 $logcatFiltered = Join-Path $outDir "logcat_playpulse.txt"
 try {
-    Get-Content (Join-Path $outDir "logcat_full.txt") | Select-String -Pattern "PlayPulse|PlayPulseScreenshot|PlayPulseLocaleHelper|PlayPulseScreenshotHelper|PlayPulseScreenshotTest" -SimpleMatch | Out-File $logcatFiltered -Encoding utf8
+    Get-Content (Join-Path $outDir "logcat_full.txt") | Select-String -Pattern "PlayPulse|PlayPulseScreenshot|PlayPulseLocaleHelper|PlayPulseScreenshotHelper|PlayPulseScreenshotTest|PlayPulseLocaleBridge" | Out-File $logcatFiltered -Encoding utf8
 } catch {
-    "(failed to filter logcat)" | Out-File $logcatFiltered
+    "failed to filter logcat" | Out-File $logcatFiltered -Encoding utf8
 }
 
-# Attempt to pull the two expected remote folders (results will be saved under pulled/)
 $pulledDir = Join-Path $outDir "pulled"
 New-Item -ItemType Directory -Path $pulledDir -Force | Out-Null
 
-function Try-PullRemote([string]$remote, [string]$localSub) {
-    $localPath = Join-Path $pulledDir $localSub
+function Try-PullRemote {
+    param([string]$Remote, [string]$LocalSub)
+    $localPath = Join-Path $pulledDir $LocalSub
     New-Item -ItemType Directory -Path $localPath -Force | Out-Null
-    $args = Build-Args @("pull", $remote, $localPath)
-    $outFile = Join-Path $outDir ("pull_" + ($localSub -replace '[^a-zA-Z0-9_-]','_') + ".txt")
-    Run-ADB -Args $args -OutFile $outFile
+    Run-ADB -Args (Build-Args @("pull", $Remote, $localPath)) -OutFile (Join-Path $outDir "pull_$LocalSub.txt")
 }
 
-Try-PullRemote -remote $remote1 -localSub "download_path"
-Try-PullRemote -remote $remote2 -localSub "android_data_path"
+Try-PullRemote -Remote $remoteDownload -LocalSub "download_path"
+Try-PullRemote -Remote $remoteAppSpecificLower -LocalSub "android_data_lower"
+Try-PullRemote -Remote $remoteAppSpecificLegacy -LocalSub "android_data_legacy"
 
-# Compress results
 $zipPath = "$outDir.zip"
 try {
     Compress-Archive -Path $outDir -DestinationPath $zipPath -Force
@@ -91,5 +107,3 @@ try {
 } catch {
     Write-Host "Collected files at: $outDir (failed to zip: $($_.Exception.Message))"
 }
-
-Write-Host "Done. Upload the zip or paste key files: devices.txt, found_dirs.txt, png_samples.txt, logcat_playpulse.txt, remote_path_download.txt, remote_path_android_data.txt"

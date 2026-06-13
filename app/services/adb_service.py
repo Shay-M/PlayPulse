@@ -384,6 +384,88 @@ class ADBService:
     def get_device_model(self, device_serial: str, manual_adb_path: str = "") -> str:
         return self._read_required_device_property(device_serial, "ro.product.model", manual_adb_path)
 
+
+    def get_system_locale(self, device_serial: str, manual_adb_path: str = "") -> str:
+        result = self.run_adb_command(
+            ["shell", "settings", "get", "system", "system_locales"],
+            device_serial=device_serial,
+            manual_adb_path=manual_adb_path,
+            timeout=12,
+        )
+        self._record_command_result(device_serial, result, "Read Android system locale.")
+        if result.exit_code != 0:
+            return ""
+        return result.stdout.strip()
+
+    def set_system_locale(self, device_serial: str, locale: str, manual_adb_path: str = "") -> None:
+        locale_value = locale.strip()
+        if not locale_value:
+            raise ADBUserError("System locale value is required.")
+        result = self.run_adb_command(
+            ["shell", "settings", "put", "system", "system_locales", locale_value],
+            device_serial=device_serial,
+            manual_adb_path=manual_adb_path,
+            timeout=20,
+        )
+        self._record_command_result(device_serial, result, f"Set Android system locale to {locale_value}.")
+        if result.exit_code != 0:
+            raise ADBUserError(result.stderr or result.error_message or f"Could not set Android system locale to {locale_value}.")
+
+    def reboot_device(self, device_serial: str, manual_adb_path: str = "") -> None:
+        result = self.run_adb_command(
+            ["reboot"],
+            device_serial=device_serial,
+            manual_adb_path=manual_adb_path,
+            timeout=20,
+        )
+        self._record_command_result(device_serial, result, "Reboot command sent to Android device.")
+        if result.exit_code != 0:
+            raise ADBUserError(result.stderr or result.error_message or "Could not reboot Android device.")
+
+    def wait_for_device_ready(
+        self,
+        device_serial: str,
+        manual_adb_path: str = "",
+        timeout_seconds: int = 180,
+        stabilization_seconds: float = 5.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ADBUserError("Device ready timeout must be greater than zero.")
+
+        wait_result = self.run_adb_command(
+            ["wait-for-device"],
+            device_serial=device_serial,
+            manual_adb_path=manual_adb_path,
+            timeout=timeout_seconds,
+        )
+        self._record_command_result(device_serial, wait_result, "Android device is connected after reboot.")
+        if wait_result.exit_code != 0 or wait_result.timed_out:
+            raise ADBUserError(wait_result.stderr or wait_result.error_message or "Device did not reconnect after reboot.")
+
+        deadline = time.time() + timeout_seconds
+        last_value = ""
+        while time.time() < deadline:
+            boot_result = self.run_adb_command(
+                ["shell", "getprop", "sys.boot_completed"],
+                device_serial=device_serial,
+                manual_adb_path=manual_adb_path,
+                timeout=12,
+            )
+            last_value = boot_result.stdout.strip()
+            if boot_result.exit_code == 0 and last_value == "1":
+                try:
+                    self.get_android_sdk_version(device_serial, manual_adb_path)
+                except ADBUserError:
+                    time.sleep(2)
+                    continue
+                if stabilization_seconds > 0:
+                    time.sleep(stabilization_seconds)
+                self._record_command_result(device_serial, boot_result, "Android device boot completed.")
+                return
+            time.sleep(2)
+
+        raise ADBUserError(f"Android device did not finish booting within {timeout_seconds} seconds. Last sys.boot_completed={last_value!r}.")
+
     def open_locale_settings(self, device_serial: str, manual_adb_path: str = "") -> None:
         result = self.run_adb_command(
             [

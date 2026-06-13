@@ -4,6 +4,7 @@ from enum import Enum
 
 
 class ScreenshotStrategy(str, Enum):
+    APP_DEBUG_ADB = "app_debug_adb"
     UI_TEST = "ui_test"
     MANUAL_ADB = "manual_adb"
     INTERNAL_ADB_FLOW = "internal_adb_flow"
@@ -12,4 +13,4 @@ class ScreenshotStrategy(str, Enum):
 
     @classmethod
     def default(cls) -> "ScreenshotStrategy":
-        return cls.UI_TEST
+        return cls.APP_DEBUG_ADB

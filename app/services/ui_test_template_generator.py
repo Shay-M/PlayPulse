@@ -1,31 +1,54 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Mapping
 
 
 class UITestTemplateGenerator:
     DEFAULT_PACKAGE_NAME = "com.example.playpulse"
+    DEFAULT_SCREENSHOT_NAMES = ("home", "after_navigation")
+    SCREENSHOT_DIRECTORY_NAME = "playpulse_screenshots"
 
-    def __init__(self, project_path: str, package_name: str) -> None:
-        self.project_path = Path(project_path) if project_path else Path.cwd()
-        self.package_name = (package_name or self.DEFAULT_PACKAGE_NAME).strip() or self.DEFAULT_PACKAGE_NAME
+    def __init__(
+        self,
+        project_path: str,
+        package_name: str,
+        app_module_path: str = "app",
+        test_package_name: str | None = None,
+        screenshot_names: Iterable[str] | None = None,
+        locales: Iterable[str] | None = None,
+        clean_output_before_run: bool = True,
+        feature_flags: Mapping[str, object] | None = None,
+    ) -> None:
+        self.project_path = Path(project_path).expanduser() if project_path else Path.cwd()
+        self.package_name = self._normalize_package_name(package_name)
+        self.app_module_path = self._normalize_module_path(app_module_path)
+        self.test_package_name = self._normalize_package_name(
+            test_package_name or f"{self.package_name}.playpulse"
+        )
+        self.screenshot_names = tuple(
+            self._safe_identifier(name) for name in (screenshot_names or self.DEFAULT_SCREENSHOT_NAMES)
+        )
+        self.locales = tuple(self._safe_locale(locale) for locale in (locales or ("current",)))
+        self.clean_output_before_run = clean_output_before_run
+        self.feature_flags = dict(feature_flags or {})
 
     def generate_templates(self) -> Dict[str, str]:
         files: Dict[str, str] = {}
-        package_name = self.package_name
-        # target subpackage 'playpulse'
-        full_package = f"{package_name}.playpulse"
-        package_path = full_package.replace(".", "/")
+        package_path = self.test_package_name.replace(".", "/")
+        base_path = f"{self.app_module_path}/src/androidTest/java/{package_path}"
 
-        # Always generate Kotlin test helpers and config to keep implementation consistent
-        files[f"app/src/androidTest/java/{package_path}/PlayPulseTestConfig.kt"] = self._test_config_template(package_name)
-        files[f"app/src/androidTest/java/{package_path}/PlayPulseScreenshotHelper.kt"] = self._screenshot_helper_template(package_name)
-        files[f"app/src/androidTest/java/{package_path}/PlayPulseLocaleHelper.kt"] = self._locale_helper_template(package_name)
-        files[f"app/src/androidTest/java/{package_path}/PlayPulseScreenshotTest.kt"] = self._kotlin_playpulse_test_template(package_name)
+        files[f"{base_path}/PlayPulseTestConfig.kt"] = self._test_config_template()
+        files[f"{base_path}/PlayPulseLocaleHelper.kt"] = self._locale_helper_template()
+        files[f"{base_path}/PlayPulseScreenshotHelper.kt"] = self._screenshot_helper_template()
+        files[f"{base_path}/PlayPulseScreenshotTest.kt"] = self._screenshot_test_template()
         return files
 
-    def write_templates(self, files: Dict[str, str]) -> Dict[str, list[str]]:
+    def deploy_templates(self, overwrite: bool = False) -> Dict[str, list[str]]:
+        return self.write_templates(self.generate_templates(), overwrite=overwrite)
+
+    def write_templates(self, files: Dict[str, str], overwrite: bool = False) -> Dict[str, list[str]]:
         results = {
             "written": [],
             "skipped": [],
@@ -35,7 +58,7 @@ class UITestTemplateGenerator:
             path = self.project_path / relative_path
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if path.exists():
+                if path.exists() and not overwrite:
                     results["skipped"].append(str(relative_path))
                     continue
                 path.write_text(contents, encoding="utf-8")
@@ -44,191 +67,41 @@ class UITestTemplateGenerator:
                 results["errors"].append(f"{relative_path}: {exc}")
         return results
 
-    def _detect_kotlin(self) -> bool:
-        candidates = [
-            self.project_path / "app" / "build.gradle.kts",
-            self.project_path / "app" / "build.gradle",
-        ]
-        for candidate in candidates:
-            if candidate.exists() and candidate.suffix == ".kts":
-                return True
-            if candidate.exists():
-                try:
-                    content = candidate.read_text(encoding="utf-8", errors="ignore")
-                    if "kotlin-android" in content or "composeOptions" in content:
-                        return True
-                except OSError:
-                    continue
-        return False
+    def _test_config_template(self) -> str:
+        screenshot_names = ", ".join(f'"{name}"' for name in self.screenshot_names)
+        locales = ", ".join(f'"{locale}"' for locale in self.locales)
+        feature_flags = self._feature_flags_template()
+        clean_output = "true" if self.clean_output_before_run else "false"
 
-    def _build_test_template(self, package_name: str, use_kotlin: bool) -> str:
-        if use_kotlin:
-            return self._kotlin_test_template(package_name)
-        return self._java_test_template(package_name)
-
-    def _kotlin_test_template(self, package_name: str) -> str:
-        template = """package {package_name}
-
-import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.test.platform.app.InstrumentationRegistry
-import androidx.test.uiautomator.By
-import androidx.test.uiautomator.UiDevice
-import androidx.test.uiautomator.Until
-import org.junit.Assert
-import org.junit.Before
-import org.junit.Test
-import org.junit.runner.RunWith
-
-@RunWith(AndroidJUnit4::class)
-class PlayPulseScreenshotTest {
-    private lateinit var device: UiDevice
-
-    @Before
-    fun setUp() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        device = UiDevice.getInstance(instrumentation)
-        device.pressHome()
-    }
-
-    @Test
-    fun captureSampleScreenshot() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val appPackage = "{package_name}"
-        device.wait(Until.hasObject(By.pkg(appPackage).depth(0)), 10_000)
-
-        // TODO: Navigate to the target app screen before capturing a screenshot.
-        // Add a helper, Espresso action, or UI Automator flow here.
-
-        val fileName = "playpulse_screenshot_sample.png"
-        val outputFile = instrumentation.targetContext.getExternalFilesDir(null)?.resolve(fileName)
-        Assert.assertNotNull(outputFile)
-
-        // TODO: Capture the screen to outputFile using your preferred mechanism.
-        Assert.assertTrue("Screenshot target may not be ready", true)
-    }
-}
-"""
-        return template.replace("{package_name}", package_name)
-
-    def _java_test_template(self, package_name: str) -> str:
-        template = """package {package_name};
-
-import androidx.test.ext.junit.runners.AndroidJUnit4;
-import androidx.test.platform.app.InstrumentationRegistry;
-import androidx.test.uiautomator.By;
-import androidx.test.uiautomator.UiDevice;
-import androidx.test.uiautomator.Until;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-
-@RunWith(AndroidJUnit4.class)
-public class PlayPulseScreenshotTest {
-    private UiDevice device;
-
-    @Before
-    public void setUp() {
-        device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
-        device.pressHome();
-    }
-
-    @Test
-    public void captureSampleScreenshot() {
-        String appPackage = "{package_name}";
-        device.wait(Until.hasObject(By.pkg(appPackage).depth(0)), 10000);
-
-        // TODO: Navigate to the target app screen before capturing a screenshot.
-        // Add a helper, Espresso action, or UI Automator flow here.
-
-        String fileName = "playpulse_screenshot_sample.png";
-        Assert.assertTrue("Screenshot target may not be ready", true);
-    }
-}
-"""
-        return template.replace("{package_name}", package_name)
-
-    def _test_config_template(self, package_name: str) -> str:
-        template = """package {full_package}
+        template = """package {test_package}
 
 object PlayPulseTestConfig {
-    const val PACKAGE_NAME = "{package}"
-    // Primary output root on device
-    const val OUTPUT_ROOT = "/sdcard/Download/PlayPulseScreenshots"
+    const val APP_PACKAGE_NAME = "{app_package}"
+    const val SCREENSHOT_DIRECTORY_NAME = "{screenshot_directory}"
+    const val CLEAN_OUTPUT_BEFORE_RUN = {clean_output}
+    const val APP_LAUNCH_TIMEOUT_MS = 10_000L
+    const val SCREEN_SETTLE_MS = 1_500L
+    const val WAIT_AFTER_LOCALE_CHANGE_MS = 1_500L
+    const val LOCALE_BROADCAST_ACTION = "{app_package}.PLAYPULSE_SET_LOCALE"
+    const val LOCALE_EXTRA_KEY = "locale"
 
-    // Default locales to iterate when capturing screenshots. Edit as needed.
-    val DEFAULT_LOCALES = arrayOf("en-US")
-
-    // Default screenshot names to capture per locale.
-    val DEFAULT_SCREENSHOT_NAMES = arrayOf("home", "details")
-
-    // Wait time after sending locale change (ms)
-    const val WAIT_AFTER_LOCALE_CHANGE_MS = 1500L
+    val DEFAULT_LOCALES = arrayOf({locales})
+    val SCREENSHOT_NAMES = arrayOf({screenshot_names})
+    val FEATURE_FLAGS = {feature_flags}
 }
 """
-        return template.replace("{full_package}", f"{package_name}.playpulse").replace("{package}", package_name)
+        return (
+            template.replace("{test_package}", self.test_package_name)
+            .replace("{app_package}", self.package_name)
+            .replace("{screenshot_directory}", self.SCREENSHOT_DIRECTORY_NAME)
+            .replace("{clean_output}", clean_output)
+            .replace("{locales}", locales)
+            .replace("{screenshot_names}", screenshot_names)
+            .replace("{feature_flags}", feature_flags)
+        )
 
-    def _screenshot_helper_template(self, package_name: str) -> str:
-        template = """package {full_package}
-
-import android.app.Instrumentation
-import android.graphics.Bitmap
-import android.util.Log
-import java.io.File
-import java.io.FileOutputStream
-
-object PlayPulseScreenshotHelper {
-    private const val TAG = "PlayPulseScreenshotHelper"
-
-    /**
-     * Capture a screenshot and save it to device storage.
-     * Tries primary external path first, then falls back to app external files dir.
-     * Throws AssertionError on failure.
-     */
-    fun takeScreenshot(instrumentation: Instrumentation, packageName: String, locale: String, screenshotName: String): String {
-        val primary = PlayPulseTestConfig.OUTPUT_ROOT + "/" + packageName + "/" + locale
-        val fallbackBase = instrumentation.targetContext.getExternalFilesDir(null)
-        val fallback = fallbackBase?.let { File(it, "PlayPulseScreenshots/$locale").absolutePath }
-
-        val candidates = listOfNotNull(primary, fallback)
-        var lastError: Exception? = null
-
-        for (candidate in candidates) {
-            try {
-                val dir = File(candidate)
-                if (!dir.exists()) dir.mkdirs()
-                val file = File(dir, "$screenshotName.png")
-
-                val uiAutomation = instrumentation.uiAutomation
-                val bitmap: Bitmap? = uiAutomation.takeScreenshot()
-                if (bitmap == null) throw AssertionError("Failed to capture screenshot bitmap")
-
-                FileOutputStream(file).use { out ->
-                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
-                        throw AssertionError("Failed to compress and write PNG file")
-                    }
-                }
-
-                if (!file.exists() || file.length() == 0L) {
-                    throw AssertionError("Screenshot file was not saved correctly: ${'$'}{file.absolutePath}")
-                }
-
-                Log.i(TAG, "Screenshot saved: ${'$'}{file.absolutePath} (size=${'$'}{file.length()} bytes)")
-                return file.absolutePath
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to save screenshot to candidate path $candidate: ${'$'}{e.message}")
-                lastError = e
-            }
-        }
-
-        throw AssertionError("Failed to save screenshot for '$screenshotName' in locales $locale: ${'$'}{lastError?.message}")
-    }
-}
-"""
-        return template.replace("{full_package}", f"{package_name}.playpulse")
-
-    def _locale_helper_template(self, package_name: str) -> str:
-        template = """package {full_package}
+    def _locale_helper_template(self) -> str:
+        template = """package {test_package}
 
 import android.app.Instrumentation
 import android.content.Intent
@@ -237,101 +110,204 @@ import android.util.Log
 object PlayPulseLocaleHelper {
     private const val TAG = "PlayPulseLocaleHelper"
 
-    /**
-     * Default locale switching requires the app to implement a broadcast receiver or deep link.
-     * If the app does not implement it, screenshots will be captured in the current app language.
-     */
-    fun setAppLocale(instrumentation: Instrumentation, packageName: String, localeTag: String): Boolean {
-        val action = "${package_name}.PLAYPULSE_SET_LOCALE"
-        return try {
-            val intent = Intent(action)
-            intent.setPackage(packageName)
-            intent.putExtra("locale", localeTag)
-            instrumentation.targetContext.sendBroadcast(intent)
-            Thread.sleep(PlayPulseTestConfig.WAIT_AFTER_LOCALE_CHANGE_MS)
-            Log.i(TAG, "Locale command sent: action=$action locale=$localeTag")
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "Locale switch failed: ${'$'}{e.message}")
-            false
+    fun setAppLocale(instrumentation: Instrumentation, localeTag: String) {
+        if (localeTag == "current") {
+            Log.i(TAG, "Using current app language")
+            return
         }
+
+        val context = instrumentation.targetContext
+        val intent = Intent(PlayPulseTestConfig.LOCALE_BROADCAST_ACTION).apply {
+            setPackage(PlayPulseTestConfig.APP_PACKAGE_NAME)
+            putExtra(PlayPulseTestConfig.LOCALE_EXTRA_KEY, localeTag)
+        }
+        context.sendBroadcast(intent)
+        Log.i(TAG, "Locale broadcast sent: ${PlayPulseTestConfig.LOCALE_BROADCAST_ACTION}, locale=$localeTag")
+        Thread.sleep(PlayPulseTestConfig.WAIT_AFTER_LOCALE_CHANGE_MS)
     }
 }
 """
-        return template.replace("{full_package}", f"{package_name}.playpulse")
+        return template.replace("{test_package}", self.test_package_name)
 
-    def _kotlin_playpulse_test_template(self, package_name: str) -> str:
-        template = """package {full_package}
+    def _screenshot_helper_template(self) -> str:
+        template = """package {test_package}
 
+import android.graphics.BitmapFactory
+import android.util.Log
+import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.uiautomator.UiDevice
+import java.io.File
+
+object PlayPulseScreenshotHelper {
+    private const val TAG = "PlayPulseScreenshot"
+
+    fun clearOutputDirectory() {
+        val directory = screenshotDirectory()
+        directory.listFiles()?.forEach { child ->
+            val deleted = child.deleteRecursively()
+            if (!deleted) {
+                Log.w(TAG, "Could not delete stale screenshot path: ${child.absolutePath}")
+            }
+        }
+    }
+
+    fun capture(locale: String, name: String, device: UiDevice = currentDevice()): File {
+        val localeDirectory = File(screenshotDirectory(), safeFileName(locale))
+        if (!localeDirectory.exists() && !localeDirectory.mkdirs()) {
+            throw IllegalStateException("Could not create locale screenshot directory: ${localeDirectory.absolutePath}")
+        }
+        val outputFile = File(localeDirectory, "${safeFileName(name)}.png")
+        if (outputFile.exists() && !outputFile.delete()) {
+            throw AssertionError("Could not replace existing screenshot: ${outputFile.absolutePath}")
+        }
+
+        val captured = device.takeScreenshot(outputFile)
+        if (!captured) {
+            throw AssertionError("UiDevice failed to capture screenshot: ${outputFile.absolutePath}")
+        }
+        if (!outputFile.exists() || outputFile.length() == 0L) {
+            throw AssertionError("Screenshot file was not written: ${outputFile.absolutePath}")
+        }
+
+        val bitmap = BitmapFactory.decodeFile(outputFile.absolutePath)
+            ?: throw AssertionError("Screenshot is not a readable bitmap: ${outputFile.absolutePath}")
+        val width = bitmap.width
+        val height = bitmap.height
+        bitmap.recycle()
+
+        Log.i(TAG, "Screenshot saved: ${outputFile.absolutePath} (${width}x${height}, ${outputFile.length()} bytes)")
+        return outputFile
+    }
+
+    fun screenshotDirectoryPath(): String = screenshotDirectory().absolutePath
+
+    private fun screenshotDirectory(): File {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val externalFilesRoot = context.getExternalFilesDir(null)
+            ?: throw IllegalStateException("Target app external files directory is unavailable")
+        val directory = File(externalFilesRoot, PlayPulseTestConfig.SCREENSHOT_DIRECTORY_NAME)
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw IllegalStateException("Could not create screenshot directory: ${directory.absolutePath}")
+        }
+        return directory
+    }
+
+    private fun currentDevice(): UiDevice {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        return UiDevice.getInstance(instrumentation)
+    }
+
+    private fun safeFileName(value: String): String {
+        val cleaned = value.trim().replace(Regex("[^A-Za-z0-9._-]+"), "_").trim('_', '.', '-')
+        return cleaned.ifEmpty { "screen" }
+    }
+}
+"""
+        return template.replace("{test_package}", self.test_package_name)
+
+    def _screenshot_test_template(self) -> str:
+        template = """package {test_package}
+
+import android.content.Intent
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
-import androidx.test.uiautomator.By
-import org.junit.Assert
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class PlayPulseScreenshotTest {
     private lateinit var device: UiDevice
-    private val TAG = "PlayPulseScreenshotTest"
 
     @Before
     fun setUp() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         device = UiDevice.getInstance(instrumentation)
-        device.pressHome()
-    }
-
-    private fun launchApp(instrumentation: androidx.test.platform.app.Instrumentation, pkg: String) {
-        Log.i(TAG, "Launching app: $pkg")
-        val launchIntent = instrumentation.targetContext.packageManager.getLaunchIntentForPackage(pkg)
-        if (launchIntent != null) {
-            launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            instrumentation.targetContext.startActivity(launchIntent)
-        } else {
-            Log.w(TAG, "Launch intent not found for package: $pkg")
+        if (PlayPulseTestConfig.CLEAN_OUTPUT_BEFORE_RUN) {
+            PlayPulseScreenshotHelper.clearOutputDirectory()
         }
-    }
-
-    private fun waitForApp(pkg: String, timeoutMs: Long = 10_000L) {
-        device.wait(Until.hasObject(By.pkg(pkg).depth(0)), timeoutMs)
     }
 
     @Test
     fun capturePlayPulseScreenshots() {
-        Log.i(TAG, "Starting PlayPulse screenshot test")
+        Log.i(TAG, "Writing screenshots to ${PlayPulseScreenshotHelper.screenshotDirectoryPath()}")
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val pkg = PlayPulseTestConfig.PACKAGE_NAME
 
         for (locale in PlayPulseTestConfig.DEFAULT_LOCALES) {
-            Log.i(TAG, "Locale started: $locale")
-            val switched = PlayPulseLocaleHelper.setAppLocale(instrumentation, pkg, locale)
-            if (!switched) {
-                Log.w(TAG, "Locale switch was not successful for $locale. Screenshots will be captured in the current app language.")
-            } else {
-                Log.i(TAG, "Locale command sent for $locale")
+            PlayPulseLocaleHelper.setAppLocale(instrumentation, locale)
+            launchApp()
+            waitForApp()
+            Thread.sleep(PlayPulseTestConfig.SCREEN_SETTLE_MS)
+
+            for (screenName in PlayPulseTestConfig.SCREENSHOT_NAMES) {
+                PlayPulseScreenshotHelper.capture(locale, screenName, device)
             }
-
-            launchApp(instrumentation, pkg)
-            Log.i(TAG, "App launched: $pkg")
-            waitForApp(pkg)
-
-            for (screenshotName in PlayPulseTestConfig.DEFAULT_SCREENSHOT_NAMES) {
-                Log.i(TAG, "Capturing screenshot: $screenshotName (locale=$locale)")
-                val outPath = PlayPulseScreenshotHelper.takeScreenshot(instrumentation, pkg, locale, screenshotName)
-                Log.i(TAG, "Screenshot saved: $outPath")
-                val f = File(outPath)
-                Assert.assertTrue("Screenshot file should exist: $outPath", f.exists())
-                Assert.assertTrue("Screenshot file should not be empty: $outPath", f.length() > 0)
-            }
-
         }
+    }
+
+    private fun launchApp() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(PlayPulseTestConfig.APP_PACKAGE_NAME)
+            ?: throw AssertionError("No launcher activity found for ${PlayPulseTestConfig.APP_PACKAGE_NAME}")
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(launchIntent)
+    }
+
+    private fun waitForApp() {
+        val found = device.wait(
+            Until.hasObject(By.pkg(PlayPulseTestConfig.APP_PACKAGE_NAME).depth(0)),
+            PlayPulseTestConfig.APP_LAUNCH_TIMEOUT_MS,
+        )
+        assertTrue("App did not reach the foreground: ${PlayPulseTestConfig.APP_PACKAGE_NAME}", found)
+    }
+
+    companion object {
+        private const val TAG = "PlayPulseScreenshotTest"
     }
 }
 """
-        return template.replace("{full_package}", f"{package_name}.playpulse")
+        return template.replace("{test_package}", self.test_package_name)
+
+    def _feature_flags_template(self) -> str:
+        if not self.feature_flags:
+            return "emptyMap<String, String>()"
+        pairs = []
+        for key, value in sorted(self.feature_flags.items()):
+            safe_key = self._escape_kotlin_string(str(key))
+            safe_value = self._escape_kotlin_string(str(value))
+            pairs.append(f'"{safe_key}" to "{safe_value}"')
+        return "mapOf(" + ", ".join(pairs) + ")"
+
+    def _normalize_package_name(self, package_name: str | None) -> str:
+        candidate = (package_name or self.DEFAULT_PACKAGE_NAME).strip()
+        if self._is_valid_package(candidate):
+            return candidate
+        return self.DEFAULT_PACKAGE_NAME
+
+    def _normalize_module_path(self, module_path: str | None) -> str:
+        candidate = (module_path or "app").replace("\\", "/").strip("/")
+        return candidate or "app"
+
+    def _safe_identifier(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip()).strip("._-")
+        return cleaned or "screen"
+
+    def _safe_locale(self, value: str) -> str:
+        cleaned = str(value or "").strip().replace("_", "-")
+        if not cleaned:
+            return "current"
+        if re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*", cleaned) or cleaned == "current":
+            return cleaned
+        return "current"
+
+    def _is_valid_package(self, value: str) -> bool:
+        package_part = r"[A-Za-z_][A-Za-z0-9_]*"
+        return bool(re.fullmatch(rf"{package_part}(\.{package_part})+", value))
+
+    def _escape_kotlin_string(self, value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')

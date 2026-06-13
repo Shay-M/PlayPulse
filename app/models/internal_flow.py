@@ -71,6 +71,13 @@ class InternalFlowStep:
                 "extra_key": self.extra_key,
                 "extra_value": self.extra_value,
             }
+        if self.type in {"set_system_locale", "reboot_device", "wait_for_device_ready"}:
+            data = {"type": self.type}
+            if self.text:
+                data["text"] = self.text
+            if self.seconds != 1.0:
+                data["seconds"] = self.seconds
+            return data
         if self.type in {"open_locale_settings", "go_home", "force_stop_app"}:
             return {"type": self.type, "name": self.name}
         return {"type": self.type}

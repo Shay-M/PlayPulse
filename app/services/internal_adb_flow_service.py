@@ -34,6 +34,9 @@ class InternalADBFlowService:
         "open_locale_settings",
         "go_home",
         "force_stop_app",
+        "set_system_locale",
+        "reboot_device",
+        "wait_for_device_ready",
         "run_deep_link",
         "run_broadcast",
     ]
@@ -256,6 +259,12 @@ class InternalADBFlowService:
             return "Press home"
         if step.type == "force_stop_app":
             return f"Force stop {step.name or 'app'}"
+        if step.type == "set_system_locale":
+            return f"Set Android system locale: {step.text or '{locale}'}"
+        if step.type == "reboot_device":
+            return "Reboot Android device"
+        if step.type == "wait_for_device_ready":
+            return "Wait for Android boot completion"
         if step.type == "run_deep_link":
             return f"Run deep link: {step.text}"
         if step.type == "run_broadcast":
@@ -323,6 +332,17 @@ class InternalADBFlowService:
             if not target_package:
                 raise RuntimeError("Force stop step requires a package name.")
             self.adb_service.force_stop_app(device.identifier, target_package, manual_adb_path)
+            return {}
+        if step.type == "set_system_locale":
+            locale_value = (step.text or "{locale}").replace("{locale}", locale)
+            self.adb_service.set_system_locale(device.identifier, locale_value, manual_adb_path)
+            return {}
+        if step.type == "reboot_device":
+            self.adb_service.reboot_device(device.identifier, manual_adb_path)
+            return {}
+        if step.type == "wait_for_device_ready":
+            timeout_seconds = int(step.seconds) if step.seconds > 1 else 180
+            self.adb_service.wait_for_device_ready(device.identifier, manual_adb_path, timeout_seconds=timeout_seconds)
             return {}
         if step.type == "run_deep_link":
             self.adb_service.run_deep_link(

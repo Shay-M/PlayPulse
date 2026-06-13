@@ -32,15 +32,24 @@ class GradleRunner:
         module_name = ":" + module.replace("/", ":")
         return f"{module_name}:connectedAndroidTest"
 
-    def run_connected_android_test(self, app_module_path: str = "app", timeout: int = 60 * 30) -> Dict[str, str]:
+    def run_connected_android_test(
+        self,
+        app_module_path: str = "app",
+        timeout: int = 60 * 30,
+        device_serial: str | None = None,
+    ) -> Dict[str, str]:
         try:
             gradlew = self._find_gradlew()
             task = self._module_task(app_module_path)
             cmd = [gradlew, task]
+            env = os.environ.copy()
+            if device_serial:
+                env["ANDROID_SERIAL"] = device_serial
 
             completed = subprocess.run(
                 cmd,
                 cwd=str(self.project_path),
+                env=env,
                 capture_output=True,
                 timeout=timeout,
                 check=False,

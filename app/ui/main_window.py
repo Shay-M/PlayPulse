@@ -25,6 +25,7 @@ from app.ui.pages.logs_page import LogsPage
 from app.ui.pages.metadata_page import MetadataPage
 from app.ui.pages.project_setup_page import ProjectSetupPage
 from app.ui.pages.screenshots_page import ScreenshotsPage
+from app.ui.pages.about_page import AboutPage
 from app.ui.styles import load_stylesheet
 from app.ui.workers import WorkerPool
 
@@ -32,7 +33,7 @@ from app.ui.workers import WorkerPool
 class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Android Store Localization & Deployment Tool")
+        self.setWindowTitle("PlayPulse - Android Store Localization & Deployment Tool")
         self.setMinimumSize(1240, 780)
         self.app_state = AppState()
         self.settings_service = SettingsService()
@@ -89,6 +90,7 @@ class MainWindow(QWidget):
             self.worker_pool,
         )
         self.logs_page = LogsPage(self.app_state, self.log_service)
+        self.about_page = AboutPage()
 
         self.pages = [
             self.project_page,
@@ -96,6 +98,7 @@ class MainWindow(QWidget):
             self.screenshots_page,
             self.deployment_page,
             self.logs_page,
+            self.about_page,
         ]
         for page in self.pages:
             self.stack.addWidget(self._wrap_page(page))
@@ -122,7 +125,7 @@ class MainWindow(QWidget):
         sidebar_layout.addWidget(subtitle)
         sidebar_layout.addSpacing(12)
 
-        for label in ["Project Setup", "Store Metadata", "Screenshots", "Deployment", "Logs"]:
+        for label in ["Project Setup", "Store Metadata", "Screenshots", "Deployment", "Logs", "About"]:
             sidebar_layout.addWidget(self._create_nav_button(label))
 
         sidebar_layout.addStretch()

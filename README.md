@@ -1,5 +1,8 @@
 # PlayPulse
 
+Version: 0.4.1  
+Build: 2026-06-13
+
 PlayPulse is a professional PyQt6 desktop frontend for Android Store localization and deployment workflows. It guides an Android app through project scanning, locale selection, localized Google Play metadata generation, screenshot preparation, deployment validation, and centralized logs.
 
 The current version is frontend-first, with a hardened manual ADB screenshot workflow, an internal JSON-based ADB flow engine, and replaceable service classes so Gemini, Maestro, Fastlane, and Google Play integrations can be added later without rewriting the UI.
@@ -167,11 +170,15 @@ For in-app screenshots, PlayPulse shows only:
 - `In-app recorded language flow`
 - `Combined: device + app language`
 
+The recommended in-app strategy is `App debug command` plus the existing ADB screenshot capture flow.
+
 For widget and home-screen screenshots, PlayPulse shows only:
 
 - `Current language only`
+- `Device language command with reboot`
 - `Device language recorded flow`
-- `Combined: device + app language`
+- `Combined: system command + app language`
+- `Combined: recorded device + app language`
 
 Multi-locale capture is blocked when Locale Preparation is not real enough to change language:
 
@@ -179,6 +186,7 @@ Multi-locale capture is blocked when Locale Preparation is not real enough to ch
 - Multiple locales with `Current language only` are blocked.
 - `App debug command` requires a valid deep link template or broadcast configuration.
 - `In-app recorded language flow` requires every locale to have an assigned app-language flow.
+- `Device language command with reboot` uses `settings put system system_locales <locale>` and reboots the device.
 - `Device language recorded flow` requires every locale to have an assigned device-language flow.
 - Opening Android language settings alone is not considered a successful language change.
 
@@ -343,3 +351,91 @@ README.md
 ## Notes
 
 The app uses `QThreadPool` and `QRunnable` through `app/ui/workers.py` for long-running operations. The same worker pattern is ready for real network calls, command execution, screenshot capture, and upload workflows.
+
+## Recommended Screenshot Strategies
+
+PlayPulse now separates the recommended in-app flow from advanced capture modes.
+
+Recommended for normal in-app screenshots:
+
+```text
+App Debug Command + PlayPulse ADB Capture
+```
+
+In this mode, PlayPulse sends a locale command to the app, waits for the app to apply the language, then captures screenshots with the existing ADB screenshot engine. This avoids the complexity of saving screenshots inside Android instrumentation tests.
+
+Recommended for widget or home-screen screenshots:
+
+```text
+Device language command with reboot + PlayPulse ADB Capture
+```
+
+This uses Android system locale changes through ADB:
+
+```text
+adb -s <device> shell settings put system system_locales <locale>
+adb -s <device> reboot
+```
+
+PlayPulse then waits for the device to boot, goes to the home screen if needed, and captures the widget. This is slower because it can take 1-3 minutes per locale, but it is useful when widgets depend on the Android launcher/system language.
+
+Advanced strategies remain available:
+
+- Manual ADB capture
+- Internal ADB Flow Engine
+- UI Test / Screenshot Test
+- Optional Maestro
+
+## App Locale Bridge
+
+For apps you control, PlayPulse can generate an App Locale Bridge under the Android app module. The bridge lets PlayPulse send a package-specific broadcast such as:
+
+```text
+adb shell am broadcast -a <package>.PLAYPULSE_SET_LOCALE --es locale en-US
+```
+
+The generated bridge validates supported locales and attempts to apply the locale through AppCompat by reflection when AppCompat is available. It also saves the selected locale in a small PlayPulse preference so you can connect it to your app's own locale system.
+
+Use the Screenshots page strategy:
+
+```text
+Recommended: App Debug Command + ADB Capture
+```
+
+Then open the `Locale Bridge` tab:
+
+1. Click `Preview Locale Bridge changes`.
+2. Review the Kotlin files and AndroidManifest receiver snippet.
+3. Click `Apply Locale Bridge files`.
+4. Use `Language Preparation -> App debug command -> Broadcast`.
+5. Use the package-specific action shown in the preview:
+   `<package>.PLAYPULSE_SET_LOCALE`.
+
+The generated bridge is intended for development/internal screenshot builds. Review the generated manifest receiver before using it in production builds.
+
+## UI Test / Screenshot Test Strategy
+
+UI Test support remains available as an advanced strategy. It can generate Android instrumentation test files under:
+
+```text
+app/src/androidTest/java/<package>/playpulse/
+```
+
+The generated test writes screenshots to the target app external files folder:
+
+```text
+/sdcard/Android/data/<package>/files/playpulse_screenshots/
+```
+
+PlayPulse can collect those files with ADB after `connectedAndroidTest` finishes. The recommended default for in-app screenshots is still App Debug Command + PlayPulse ADB Capture because it uses the already hardened ADB screenshot flow and avoids Android storage collection issues.
+
+## Device Language Command With Reboot
+
+If manual testing confirms that this command works on your emulator:
+
+```text
+adb -s emulator-5554 shell settings put system system_locales he-IL
+adb -s emulator-5554 reboot
+```
+
+then choose `Widget / Device Language Capture` and `Device language command with reboot`. PlayPulse will run the system locale command per locale, reboot, wait for boot completion, and then capture screenshots.

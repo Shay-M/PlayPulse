@@ -22,6 +22,7 @@ class UITestSetupAnalyzer:
         "androidx.compose.ui:ui-test-junit4",
         "androidx.compose.ui:ui-test-manifest",
     ]
+    COMPOSE_DEPS = COMPOSE_TEST_DEPS
 
     def __init__(self, project_path: str) -> None:
         self.project_path = str(Path(project_path).expanduser()) if project_path else ""
@@ -89,8 +90,9 @@ class UITestSetupAnalyzer:
             runner_match = re.search(r"testInstrumentationRunner\s*[= ]\s*[\"']([^\"']+)[\"']", text)
             if runner_match:
                 status.test_instrumentation_runner = runner_match.group(1)
-            # Detect androidTestImplementation deps
+            # Detect androidTestImplementation deps in both Groovy and Kotlin DSL.
             deps = re.findall(r"androidTestImplementation\s+['\"]([^'\"]+)['\"]", text)
+            deps += re.findall(r"androidTestImplementation\(\s*['\"]([^'\"]+)['\"]\s*\)", text)
             status.android_test_dependencies.extend(deps)
 
         # If applicationId missing, try to read from manifest

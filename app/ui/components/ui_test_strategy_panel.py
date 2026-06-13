@@ -201,7 +201,7 @@ class UITestStrategyPanel(QWidget):
             return
 
         self.app_module_path = status.app_module_path or "app"
-        self.package_name = status.namespace or status.package_name or status.application_id or ""
+        self.package_name = status.application_id or status.package_name or status.namespace or ""
 
         self.detail_app_module.setText(f"App module: {status.app_module_path or 'N/A'}")
         self.detail_namespace.setText(f"Namespace: {status.namespace or status.package_name or 'N/A'}")
@@ -272,7 +272,12 @@ class UITestStrategyPanel(QWidget):
         self.worker_pool.start(worker)
 
     def _generate_ui_test_templates(self, project_path: str, package_name: str) -> dict[str, str]:
-        generator = UITestTemplateGenerator(project_path, package_name)
+        generator = UITestTemplateGenerator(
+            project_path,
+            package_name,
+            app_module_path=self.app_module_path or "app",
+            locales=self.state.selected_locale_codes() or ["current"],
+        )
         return generator.generate_templates()
 
     def on_ui_test_template_preview_finished(self, result: dict[str, str]) -> None:
@@ -304,7 +309,11 @@ class UITestStrategyPanel(QWidget):
 
     def _apply_ui_test_templates(self, project_path: str, files_map: dict[str, str]) -> dict[str, list[str]]:
         results = {"written": [], "skipped": [], "errors": []}
-        generator = UITestTemplateGenerator(project_path, self.package_name or self.state.detected_package_name)
+        generator = UITestTemplateGenerator(
+            project_path,
+            self.package_name or self.state.detected_package_name,
+            app_module_path=self.app_module_path or "app",
+        )
         template_results = generator.write_templates(files_map)
         gradle_requirements = GradleModifier(project_path).generate_requirements()
         gradle_results = GradleModifier(project_path).apply_requirements(gradle_requirements)
@@ -342,7 +351,7 @@ class UITestStrategyPanel(QWidget):
         if gradle_errors:
             messages.append(f"Gradle errors: {', '.join(gradle_errors)}")
 
-        ok_to_proceed = bool(written and not errors and not gradle_errors)
+        ok_to_proceed = bool((written or skipped or gradle_written or gradle_skipped) and not errors and not gradle_errors)
         self.apply_ui_test_templates_button.setEnabled(ok_to_proceed)
         self.run_connected_tests_button.setEnabled(ok_to_proceed)
         self.ui_test_warnings.setPlainText("\n".join(messages).strip())
@@ -390,9 +399,9 @@ class UITestStrategyPanel(QWidget):
     def on_collect_screenshots_clicked(self) -> None:
         if not self.package_name:
             self.package_name = self.last_ui_test_analysis_status and (
-                self.last_ui_test_analysis_status.namespace
+                self.last_ui_test_analysis_status.application_id
                 or self.last_ui_test_analysis_status.package_name
-                or self.last_ui_test_analysis_status.application_id
+                or self.last_ui_test_analysis_status.namespace
             ) or self.state.detected_package_name
         if not self.package_name:
             self._set_status("warning", "Package name missing")
